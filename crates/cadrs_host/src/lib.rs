@@ -13,9 +13,10 @@
 //! It is the same peer from run to run, and prints its cadrs ID, which is what a document is
 //! shared with and transferred to.
 //!
-//! This first step answers Join, Propose and Status. Comments, versions, locks, sharing
-//! requests, handover and transfers are refused for now, and the history log is not written
-//! yet: each numbered edit is saved as the document itself.
+//! Each numbered edit goes into the document's history log, as its author's, the way the
+//! owner's app records it; versions are made there (**Create version** by whoever may edit),
+//! and comments are kept next to the document. It answers Join, Propose, Status, Comment and
+//! CreateVersion; locks, sharing requests, handover and transfers are refused for now.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,16 +24,18 @@ use std::time::Duration;
 
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
-use cadrs_core::collab::comments::Comments;
+use cadrs_core::collab::comments::{CommentOp, Comments};
 use cadrs_core::collab::sync::{Refusal, Sequencer};
 use cadrs_core::collab::{Permission, Snapshot};
-use cadrs_core::history_log::document_hash;
+use cadrs_core::history_log::{HistoryLog, Origin, VersionId, document_hash};
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, DocumentId, Store};
 use cadrs_net::bevy_iroh::iroh::EndpointId;
 use cadrs_net::bevy_iroh::prelude::{NetSender, Peer};
 use cadrs_net::bevy_iroh::{Iroh, Relays};
-use cadrs_net::{Ask, Request, Requests, Sequenced, Verdict, Welcome, session};
+use cadrs_net::{
+    Ask, CommentChanged, Request, Requests, Sequenced, Verdict, VersionCreated, Welcome, session,
+};
 
 /// How often the data dir is read again for documents that came, went or changed rooms.
 const SCAN_EVERY: f64 = 5.0;
@@ -91,6 +94,8 @@ struct Hosted {
     seq: Sequencer,
     /// The document after the last numbered edit.
     confirmed: Box<Document>,
+    /// Its history, up to `confirmed`.
+    log: HistoryLog,
     meta: DocumentMeta,
     /// When the first edit not saved yet was numbered.
     unsaved: Option<f64>,
@@ -105,9 +110,16 @@ struct Documents {
     open: HashMap<DocumentId, Hosted>,
 }
 
-/// Numbered edits on their way to their rooms.
+/// What the host tells a room.
+enum Outgoing {
+    Edit(Sequenced),
+    Version(VersionCreated),
+    Comment(CommentChanged),
+}
+
+/// Messages on their way to their rooms.
 #[derive(Resource, Default)]
-struct Outbox(Vec<(Entity, Sequenced)>);
+struct Outbox(Vec<(Entity, Outgoing)>);
 
 pub fn run(host: Host) -> AppExit {
     if let Err(e) = std::fs::create_dir_all(&host.dir) {
@@ -174,6 +186,36 @@ fn epoch() -> u64 {
     uuid::Uuid::new_v4().as_u64_pair().0 | 1
 }
 
+/// The time the history log and the document's dates are in.
+fn unix_now() -> i64 {
+    cadrs_net::public::unix_now() as i64
+}
+
+/// The document's history log, started if it has none and caught up with the document if it
+/// was changed without it (by the app, before it was handed to the host).
+fn open_log(store: &Store, doc: &Document, meta: &DocumentMeta, host: &str) -> HistoryLog {
+    let loaded = match HistoryLog::load(store, doc.id) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                "cannot read the history of {}: {e}; starting a new one",
+                doc.name
+            );
+            None
+        }
+    };
+    let mut changed = loaded.as_ref().is_none_or(HistoryLog::upgraded);
+    let mut log = loaded.unwrap_or_else(|| HistoryLog::start(doc, meta.created, host));
+    if log.head() != doc {
+        log.catch_up(doc, unix_now(), host);
+        changed = true;
+    }
+    if changed && let Err(e) = log.save(store) {
+        error!("cannot save the history of {}: {e}", doc.name);
+    }
+    log
+}
+
 /// Opens a room for each shared document the host owns, and leaves the room of one that is no
 /// longer shared, was trashed, or moved to a new room (link sharing turned off).
 fn scan(world: &mut World, mut last: Local<Option<f64>>) {
@@ -216,6 +258,8 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
             }
         };
         let name = file.document.name.clone();
+        let host = world.resource::<Documents>().name.clone();
+        let log = open_log(&store, &file.document, &file.meta, &host);
         let room = session::host_room(&mut world.commands(), topic, &name);
         world.flush();
         info!("hosting {name} in its room");
@@ -228,6 +272,7 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
                 epoch: epoch(),
                 seq: Sequencer::new(0),
                 confirmed: Box::new(file.document),
+                log,
                 meta: file.meta,
                 unsaved: None,
             },
@@ -240,10 +285,13 @@ fn close(world: &mut World, id: DocumentId, store: &Store) {
     let Some(h) = world.resource_mut::<Documents>().open.remove(&id) else {
         return;
     };
-    if h.unsaved.is_some()
-        && let Err(e) = store.save(&h.confirmed, &h.meta)
-    {
-        error!("cannot save {}: {e}", h.name);
+    if h.unsaved.is_some() {
+        if let Err(e) = store.save(&h.confirmed, &h.meta) {
+            error!("cannot save {}: {e}", h.name);
+        }
+        if let Err(e) = h.log.save(store) {
+            error!("cannot save the history of {}: {e}", h.name);
+        }
     }
     if let Ok(e) = world.get_entity_mut(h.room) {
         e.despawn();
@@ -273,6 +321,8 @@ fn serve(world: &mut World) {
         match r.ask {
             Ask::Join => join(world, r),
             Ask::Propose { .. } => propose(world, r),
+            Ask::Comment(_) => comment(world, r),
+            Ask::CreateVersion { .. } => version(world, r),
             Ask::Status => {
                 let open = hosted(world, &r).is_ok();
                 r.verdict(Verdict::Accepted(open as u64))
@@ -358,9 +408,18 @@ fn propose(world: &mut World, r: Request) {
                 &change,
                 document_hash(&h.confirmed),
             );
+            h.log.record(
+                &h.confirmed,
+                Origin::Command(String::new()),
+                unix_now(),
+                &author_name,
+            );
             h.unsaved.get_or_insert(t);
             let room = h.room;
-            world.resource_mut::<Outbox>().0.push((room, m));
+            world
+                .resource_mut::<Outbox>()
+                .0
+                .push((room, Outgoing::Edit(m)));
             Verdict::Accepted(seq)
         }
         Err(Refusal::Conflict { author: first, .. }) => {
@@ -375,9 +434,142 @@ fn propose(world: &mut World, r: Request) {
     r.verdict(verdict);
 }
 
+/// A comment from someone the document is shared with, kept next to it and passed on to the
+/// room.
+fn comment(world: &mut World, r: Request) {
+    let Ask::Comment(op) = &r.ask else { return };
+    let from = r.from.to_string();
+    let room = match hosted(world, &r) {
+        Ok(h) => {
+            let may = h
+                .meta
+                .sharing
+                .as_ref()
+                .and_then(|s| s.access(&from))
+                .is_some_and(|a| a.rights.comment);
+            if !may {
+                return r.verdict(Verdict::Refused(
+                    "You may not comment on this document".into(),
+                ));
+            }
+            h.room
+        }
+        Err(why) => return r.refuse(why),
+    };
+    // (Each comment is its author's: one in someone else's name is not taken.)
+    if let CommentOp::Add(c) = op
+        && c.author != from
+    {
+        return r.verdict(Verdict::Refused(
+            "A comment can only be added in one's own name".into(),
+        ));
+    }
+    let me = world
+        .get_resource::<Iroh>()
+        .and_then(|i| cadrs_net::cadrs_id(Some(i)))
+        .unwrap_or_default();
+    let dir = world.resource::<Documents>().store.doc_dir(r.document);
+    let mut cs = Comments::load(&dir);
+    let result = cs
+        .apply(op, &from, &me)
+        .map_err(|e| e.to_string())
+        .and_then(|()| cs.save(&dir).map_err(|e| e.to_string()));
+    match result {
+        Ok(()) => {
+            if let Some(m) = CommentChanged::new(r.document, &from, op) {
+                world
+                    .resource_mut::<Outbox>()
+                    .0
+                    .push((room, Outgoing::Comment(m)));
+            }
+            r.verdict(Verdict::Accepted(0));
+        }
+        Err(why) => {
+            info!("comment from {} not applied: {why}", r.from.fmt_short());
+            r.verdict(Verdict::Refused(why));
+        }
+    }
+}
+
+/// **Create version**, asked by someone who may edit: made of the document as everyone has
+/// it (after the last numbered edit), and told to the room, where everyone makes the same
+/// version of their copy at that edit.
+fn version(world: &mut World, r: Request) {
+    let Ask::CreateVersion {
+        epoch,
+        name,
+        description,
+    } = &r.ask
+    else {
+        return;
+    };
+    let from = r.from.to_string();
+    match hosted(world, &r) {
+        Ok(h) if h.epoch != *epoch => return r.verdict(Verdict::Resync),
+        Ok(h)
+            if h.meta.sharing.as_ref().and_then(|s| s.permission(&from))
+                != Some(Permission::Edit) =>
+        {
+            return r.verdict(Verdict::Refused(
+                "You have view access to this document".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(why) => return r.refuse(why),
+    }
+    let user = peer_name(world, r.from);
+    let time = unix_now();
+    let mut docs = world.resource_mut::<Documents>();
+    let docs = &mut *docs;
+    let Some(h) = docs.open.get_mut(&r.document) else {
+        return r.verdict(Verdict::Closed);
+    };
+    let id = h
+        .log
+        .create_version_with_id(VersionId::new(), name, description, time, &user);
+    let made = h
+        .log
+        .versions()
+        .iter()
+        .find(|v| v.id() == id)
+        .map(|v| v.name().to_string())
+        .unwrap_or_default();
+    if let Err(e) = h.log.save(&docs.store) {
+        error!("cannot save the history of {}: {e}", h.name);
+        return r.verdict(Verdict::Refused(format!("The host could not save it: {e}")));
+    }
+    info!("{user} made version {made} of {}", h.name);
+    let m = VersionCreated {
+        document: r.document,
+        epoch: h.epoch,
+        seq: h.seq.seq(),
+        id: id.0,
+        name: made,
+        description: description.clone(),
+        time,
+        user,
+    };
+    let room = h.room;
+    world
+        .resource_mut::<Outbox>()
+        .0
+        .push((room, Outgoing::Version(m)));
+    r.verdict(Verdict::Accepted(0));
+}
+
 fn send(mut outbox: ResMut<Outbox>, net: NetSender) {
     for (room, m) in outbox.0.drain(..) {
-        net.broadcast(room, &m);
+        match m {
+            Outgoing::Edit(m) => {
+                net.broadcast(room, &m);
+            }
+            Outgoing::Version(m) => {
+                net.broadcast(room, &m);
+            }
+            Outgoing::Comment(m) => {
+                net.broadcast(room, &m);
+            }
+        }
     }
 }
 
@@ -390,9 +582,12 @@ fn save(world: &mut World) {
         if h.unsaved.is_none_or(|since| t - since < SAVE_AFTER) {
             continue;
         }
-        h.meta.modified = cadrs_net::public::unix_now() as i64;
+        h.meta.modified = unix_now();
         match docs.store.save(&h.confirmed, &h.meta) {
-            Ok(()) => h.unsaved = None,
+            Ok(()) => {
+                h.unsaved = None;
+                h.log.save_in_background(&docs.store);
+            }
             Err(e) => {
                 error!("cannot save {}: {e}", h.name);
                 // Try again in a while, not every frame.

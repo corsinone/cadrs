@@ -1,13 +1,16 @@
 //! A host and its peers in one process, over real iroh with no relay: the host owns a shared
 //! document in its data dir, an editor fetches it and edits it, a viewer and a stranger are
-//! kept to what they may do, and the edit is on disk afterwards.
+//! kept to what they may do, the editor makes a version and the viewer comments, and all of it
+//! is on disk afterwards: the document, its history log and its comments.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
+use cadrs_core::collab::comments::{Comment, CommentOp, Comments};
 use cadrs_core::collab::sync::Change;
 use cadrs_core::collab::{Member, Permission, Sharing};
+use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, Store};
 use cadrs_net::bevy_iroh::{Iroh, IrohTask, Relays};
@@ -61,6 +64,21 @@ fn wait<T>(apps: &mut [&mut App], mut task: IrohTask<T>) -> T {
 fn fetch(host: &mut App, peer: &mut App, link: &ShareLink) -> Result<Welcome, String> {
     let task = transfer::start_fetch(peer.world().resource::<Iroh>(), link.clone());
     wait(&mut [host, peer], task)
+}
+
+fn comment(author: &App, text: &str) -> CommentOp {
+    CommentOp::Add(Comment {
+        id: uuid::Uuid::new_v4(),
+        parent: None,
+        author: id_of(author),
+        author_name: "Viewer".into(),
+        time: 0,
+        text: text.into(),
+        tag: None,
+        assignee: None,
+        resolved: false,
+        edited: None,
+    })
 }
 
 fn temp_dir() -> PathBuf {
@@ -124,6 +142,20 @@ fn the_host_sends_its_document_numbers_edits_and_saves_them() {
         Ok(Verdict::Resync)
     );
 
+    // The editor makes a version of it as it is now.
+    let iroh = editor.world().resource::<Iroh>();
+    let task = transfer::start_create_version(
+        iroh,
+        &link,
+        welcome.epoch,
+        "Before review".into(),
+        String::new(),
+    );
+    assert_eq!(
+        wait(&mut [&mut host, &mut editor], task),
+        Ok(Verdict::Accepted(0))
+    );
+
     // The viewer gets the document with the edit in it, and may not edit.
     let seen = fetch(&mut host, &mut viewer, &link).unwrap();
     assert_eq!(seen.access.permission, Permission::View);
@@ -131,6 +163,26 @@ fn the_host_sends_its_document_numbers_edits_and_saves_them() {
     assert_eq!(seen.snapshot.document.name, "Frame v2");
     let iroh = viewer.world().resource::<Iroh>();
     let task = transfer::start_propose(iroh, &link, seen.epoch, 1, 1, &change);
+    assert!(matches!(
+        wait(&mut [&mut host, &mut viewer], task),
+        Ok(Verdict::Refused(_))
+    ));
+
+    // Nor make a version; but they may comment, in their own name only.
+    let iroh = viewer.world().resource::<Iroh>();
+    let task = transfer::start_create_version(iroh, &link, seen.epoch, "Mine".into(), "".into());
+    assert!(matches!(
+        wait(&mut [&mut host, &mut viewer], task),
+        Ok(Verdict::Refused(_))
+    ));
+    let iroh = viewer.world().resource::<Iroh>();
+    let task = transfer::start_comment(iroh, &link, comment(&viewer, "Thicker arms?"));
+    assert_eq!(
+        wait(&mut [&mut host, &mut viewer], task),
+        Ok(Verdict::Accepted(0))
+    );
+    let iroh = viewer.world().resource::<Iroh>();
+    let task = transfer::start_comment(iroh, &link, comment(&editor, "Not mine"));
     assert!(matches!(
         wait(&mut [&mut host, &mut viewer], task),
         Ok(Verdict::Refused(_))
@@ -154,5 +206,14 @@ fn the_host_sends_its_document_numbers_edits_and_saves_them() {
         assert!(start.elapsed() < PATIENCE, "the host never saved the edit");
         std::thread::sleep(Duration::from_millis(16));
     }
+    // So do its history (the edit, as the editor's, and the version) and the comment.
+    let mut log = HistoryLog::load(&store, doc.id).unwrap().unwrap();
+    assert_eq!(log.head().name, "Frame v2");
+    assert_eq!(log.len(), 2);
+    let versions: Vec<&str> = log.versions().iter().map(|v| v.name()).collect();
+    assert_eq!(versions, ["Before review"]);
+    let comments = Comments::load(&store.doc_dir(doc.id));
+    assert_eq!(comments.0.len(), 1);
+    assert_eq!(comments.0[0].text, "Thicker arms?");
     let _ = std::fs::remove_dir_all(&dir);
 }
