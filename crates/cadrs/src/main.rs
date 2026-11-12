@@ -83,6 +83,10 @@ Usage:
       Runs a seed peer for public documents without a window: it stays in the public room and
       keeps every listing, star and published document, for others to start from. Its data dir
       defaults to ~/.local/share/cadrs/seed; it prints its cadrs ID.
+  cadrs --host [--data-dir <dir>] [--name <name>]
+      Runs a host without a window: the always-online owner of the shared documents in its
+      data dir. It keeps their rooms, sends them to whoever may join and numbers everyone's
+      edits. Its data dir defaults to ~/.local/share/cadrs/host; it prints its cadrs ID.
   cadrs --install
       Installs this build for the current user, with a launcher entry (Linux, macOS, Windows;
       `cargo install-local`).
@@ -149,6 +153,16 @@ fn main() -> AppExit {
             Err(e) => {
                 eprintln!("{e}");
                 AppExit::from_code(1)
+            }
+        };
+    }
+    // `--host`: the always-online owner of a team's documents, no window.
+    if let Some(h) = cadrs_host::parse(&args) {
+        return match h {
+            Ok(h) => cadrs_host::run(h),
+            Err(e) => {
+                eprintln!("{e}");
+                AppExit::from_code(2)
             }
         };
     }

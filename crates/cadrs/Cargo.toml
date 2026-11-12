@@ -12,6 +12,7 @@ bevy.workspace = true
 cadrs_app = { workspace = true, default-features = false, features = ["kicad"] }
 cadrs_core.workspace = true
 cadrs_harness.workspace = true
+cadrs_host.workspace = true
 cadrs_net.workspace = true
 cadrs_ui.workspace = true
 

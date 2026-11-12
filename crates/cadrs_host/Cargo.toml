@@ -1,0 +1,14 @@
+[package]
+name = "cadrs_host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# `cadrs --host`: the always-online owner of a team's documents, with no window. It needs the
+# document model and the network, not the app.
+[dependencies]
+bevy.workspace = true
+cadrs_core.workspace = true
+cadrs_net.workspace = true
+uuid.workspace = true

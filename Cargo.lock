@@ -2386,6 +2386,7 @@ dependencies = [
  "cadrs_core",
  "cadrs_fs",
  "cadrs_harness",
+ "cadrs_host",
  "cadrs_net",
  "cadrs_ui",
  "image",
@@ -2585,6 +2586,16 @@ dependencies = [
  "ron",
  "serde",
  "web-time",
+]
+
+[[package]]
+name = "cadrs_host"
+version = "0.2.7"
+dependencies = [
+ "bevy",
+ "cadrs_core",
+ "cadrs_net",
+ "uuid",
 ]
 
 [[package]]
