@@ -12,3 +12,6 @@ bevy.workspace = true
 cadrs_core.workspace = true
 cadrs_net.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

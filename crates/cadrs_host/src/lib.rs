@@ -18,7 +18,7 @@
 //! yet: each numbered edit is saved as the document itself.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bevy::app::ScheduleRunnerPlugin;
@@ -29,9 +29,9 @@ use cadrs_core::collab::{Permission, Snapshot};
 use cadrs_core::history_log::document_hash;
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, DocumentId, Store};
-use cadrs_net::bevy_iroh::Iroh;
 use cadrs_net::bevy_iroh::iroh::EndpointId;
 use cadrs_net::bevy_iroh::prelude::{NetSender, Peer};
+use cadrs_net::bevy_iroh::{Iroh, Relays};
 use cadrs_net::{Ask, Request, Requests, Sequenced, Verdict, Welcome, session};
 
 /// How often the data dir is read again for documents that came, went or changed rooms.
@@ -121,22 +121,15 @@ pub fn run(host: Host) -> AppExit {
         ))),
         bevy::log::LogPlugin::default(),
     ));
-    app.add_plugins(cadrs_net::NetPlugin {
-        identity: Some(host.dir.join(cadrs_net::IDENTITY_FILE)),
-        display_name: host.name.clone(),
-        relays: Default::default(),
-        autostart: true,
-    });
-    app.insert_resource(Documents {
-        store: Store::new(&host.dir),
-        name: host.name.clone(),
-        open: HashMap::new(),
-    })
-    .init_resource::<Outbox>()
-    .add_systems(Update, (scan, serve, send, save, report).chain());
+    let identity = Some(host.dir.join(cadrs_net::IDENTITY_FILE));
+    add(&mut app, &host.dir, &host.name, identity, Relays::default());
     match cadrs_net::cadrs_id(app.world().get_resource::<Iroh>()) {
         Some(id) => {
-            println!("cadrs host \"{}\", keeping {}", host.name, host.dir.display());
+            println!(
+                "cadrs host \"{}\", keeping {}",
+                host.name,
+                host.dir.display()
+            );
             println!("cadrs ID: {id}");
         }
         None => {
@@ -150,6 +143,24 @@ pub fn run(host: Host) -> AppExit {
         }
     }
     app.run()
+}
+
+/// Adds the network and the host to `app`: the owner of the shared documents in `dir`, under
+/// the identity in `identity` (a fresh one each run when `None`, for tests).
+pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, relays: Relays) {
+    app.add_plugins(cadrs_net::NetPlugin {
+        identity,
+        display_name: name.into(),
+        relays,
+        autostart: true,
+    });
+    app.insert_resource(Documents {
+        store: Store::new(dir),
+        name: name.into(),
+        open: HashMap::new(),
+    })
+    .init_resource::<Outbox>()
+    .add_systems(Update, (scan, serve, send, save, report).chain());
 }
 
 fn now(world: &World) -> f64 {
@@ -357,9 +368,7 @@ fn propose(world: &mut World, r: Request) {
                 Ok(id) => peer_name(world, id),
                 Err(_) => first,
             };
-            Verdict::Refused(format!(
-                "{who} changed that first: your change was undone"
-            ))
+            Verdict::Refused(format!("{who} changed that first: your change was undone"))
         }
         Err(Refusal::Stale) => Verdict::Resync,
     };
