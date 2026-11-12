@@ -1,9 +1,10 @@
 //! A host and its peers in one process, over real iroh with no relay: the host owns a shared
 //! document in its data dir, an editor fetches it and edits it, a viewer and a stranger are
 //! kept to what they may do, the editor makes a version and the viewer comments, and all of it
-//! is on disk afterwards: the document, its history log and its comments.
+//! is on disk afterwards: the document, its history log and its comments. Then two editors and
+//! a tab one of them has open for themselves.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
@@ -87,6 +88,25 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
+/// A host whose data dir holds `doc`, shared with `members`; and the link to it.
+fn host_with(dir: &Path, doc: &Document, members: Vec<Member>) -> (App, ShareLink) {
+    let mut meta = DocumentMeta::new("host", 0);
+    let mut sharing = Sharing::new(TOPIC);
+    sharing.members = members;
+    meta.sharing = Some(sharing);
+    Store::new(dir).create(doc, &meta).unwrap();
+    let mut host = App::new();
+    host.add_plugins(MinimalPlugins);
+    cadrs_host::add(&mut host, dir, "Team host", None, Relays::Disabled);
+    let link = ShareLink {
+        document: doc.id,
+        name: doc.name.clone(),
+        topic: TOPIC,
+        owner: host.world().resource::<Iroh>().addr().unwrap(),
+    };
+    (host, link)
+}
+
 #[test]
 fn the_host_sends_its_document_numbers_edits_and_saves_them() {
     let mut editor = peer("Editor");
@@ -97,24 +117,11 @@ fn the_host_sends_its_document_numbers_edits_and_saves_them() {
     let dir = temp_dir();
     let store = Store::new(&dir);
     let doc = Document::new("Frame");
-    let mut meta = DocumentMeta::new("host", 0);
-    let mut sharing = Sharing::new(TOPIC);
-    sharing.members = vec![
+    let members = vec![
         member(&editor, "Editor", Permission::Edit),
         member(&viewer, "Viewer", Permission::View),
     ];
-    meta.sharing = Some(sharing);
-    store.create(&doc, &meta).unwrap();
-
-    let mut host = App::new();
-    host.add_plugins(MinimalPlugins);
-    cadrs_host::add(&mut host, &dir, "Team host", None, Relays::Disabled);
-    let link = ShareLink {
-        document: doc.id,
-        name: doc.name.clone(),
-        topic: TOPIC,
-        owner: host.world().resource::<Iroh>().addr().unwrap(),
-    };
+    let (mut host, link) = host_with(&dir, &doc, members);
 
     // The editor gets the document, as the host has it.
     let welcome = fetch(&mut host, &mut editor, &link).unwrap();
@@ -215,5 +222,88 @@ fn the_host_sends_its_document_numbers_edits_and_saves_them() {
     let comments = Comments::load(&store.doc_dir(doc.id));
     assert_eq!(comments.0.len(), 1);
     assert_eq!(comments.0[0].text, "Thicker arms?");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_host_keeps_the_tabs_someone_has_open_for_themselves() {
+    let mut ann = peer("Ann");
+    let mut ben = peer("Ben");
+    let dir = temp_dir();
+    let doc = Document::new("Frame");
+    let members = vec![
+        member(&ann, "Ann", Permission::Edit),
+        member(&ben, "Ben", Permission::Edit),
+    ];
+    let (mut host, link) = host_with(&dir, &doc, members);
+    let ann_epoch = fetch(&mut host, &mut ann, &link).unwrap().epoch;
+    let ben_epoch = fetch(&mut host, &mut ben, &link).unwrap().epoch;
+    let tab = doc.elements[1].id;
+    let renamed = |name: &str| {
+        let mut d = doc.clone();
+        d.elements[1].name = name.into();
+        Change::between(&doc, &d)
+    };
+
+    // Ann opens the tab for herself: Ben's edit to it is undone, and he can't just take it.
+    let task = transfer::start_lock(ann.world().resource::<Iroh>(), &link, tab, true, false);
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(0))
+    );
+    let iroh = ben.world().resource::<Iroh>();
+    let task = transfer::start_propose(iroh, &link, ben_epoch, 1, 0, &renamed("Ben's"));
+    assert!(matches!(
+        wait(&mut [&mut host, &mut ben], task),
+        Ok(Verdict::Refused(_))
+    ));
+    let task = transfer::start_lock(ben.world().resource::<Iroh>(), &link, tab, true, false);
+    assert!(matches!(
+        wait(&mut [&mut host, &mut ben], task),
+        Ok(Verdict::Refused(_))
+    ));
+    // Nor give it back for her (his Unlock changes nothing).
+    let task = transfer::start_lock(ben.world().resource::<Iroh>(), &link, tab, false, false);
+    wait(&mut [&mut host, &mut ben], task).unwrap();
+    let iroh = ben.world().resource::<Iroh>();
+    let task = transfer::start_propose(iroh, &link, ben_epoch, 2, 0, &renamed("Ben's"));
+    assert!(matches!(
+        wait(&mut [&mut host, &mut ben], task),
+        Ok(Verdict::Refused(_))
+    ));
+
+    // Ann's own edit to it goes through.
+    let iroh = ann.world().resource::<Iroh>();
+    let task = transfer::start_propose(iroh, &link, ann_epoch, 1, 0, &renamed("Ann's"));
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(1))
+    );
+
+    // Ben takes it over: now Ann's edits to it are undone.
+    let task = transfer::start_lock(ben.world().resource::<Iroh>(), &link, tab, true, true);
+    assert_eq!(
+        wait(&mut [&mut host, &mut ben], task),
+        Ok(Verdict::Accepted(0))
+    );
+    let iroh = ann.world().resource::<Iroh>();
+    let task = transfer::start_propose(iroh, &link, ann_epoch, 2, 1, &renamed("Ann's again"));
+    assert!(matches!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Refused(_))
+    ));
+
+    // He gives it back, and Ann may edit it again.
+    let task = transfer::start_lock(ben.world().resource::<Iroh>(), &link, tab, false, false);
+    assert_eq!(
+        wait(&mut [&mut host, &mut ben], task),
+        Ok(Verdict::Accepted(0))
+    );
+    let iroh = ann.world().resource::<Iroh>();
+    let task = transfer::start_propose(iroh, &link, ann_epoch, 3, 1, &renamed("Ann's again"));
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(2))
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

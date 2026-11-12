@@ -15,8 +15,11 @@
 //!
 //! Each numbered edit goes into the document's history log, as its author's, the way the
 //! owner's app records it; versions are made there (**Create version** by whoever may edit),
-//! and comments are kept next to the document. It answers Join, Propose, Status, Comment and
-//! CreateVersion; locks, sharing requests, handover and transfers are refused for now.
+//! and comments are kept next to the document. It keeps the tab locks too ("Open tab, close
+//! it for other users"): it grants them, refuses the others' edits to a held tab, and lets a
+//! lock go when its holder has left the tab. It answers Join, Propose, Status, Comment,
+//! CreateVersion, Lock and Unlock; sharing requests, handover and transfers are refused for
+//! now.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,16 +28,17 @@ use std::time::Duration;
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use cadrs_core::collab::comments::{CommentOp, Comments};
-use cadrs_core::collab::sync::{Refusal, Sequencer};
+use cadrs_core::collab::sync::{Key, Refusal, Sequencer};
 use cadrs_core::collab::{Permission, Snapshot};
 use cadrs_core::history_log::{HistoryLog, Origin, VersionId, document_hash};
 use cadrs_core::library::DocumentMeta;
-use cadrs_core::{Document, DocumentId, Store};
+use cadrs_core::{Document, DocumentId, ElementId, Store};
 use cadrs_net::bevy_iroh::iroh::EndpointId;
-use cadrs_net::bevy_iroh::prelude::{NetSender, Peer};
+use cadrs_net::bevy_iroh::prelude::{NetSender, Peer, PeerJoined, Received};
 use cadrs_net::bevy_iroh::{Iroh, Relays};
 use cadrs_net::{
-    Ask, CommentChanged, Request, Requests, Sequenced, Verdict, VersionCreated, Welcome, session,
+    Ask, CommentChanged, LocksChanged, Presence, Request, Requests, Sequenced, Verdict,
+    VersionCreated, Welcome, session,
 };
 
 /// How often the data dir is read again for documents that came, went or changed rooms.
@@ -43,6 +47,11 @@ const SCAN_EVERY: f64 = 5.0;
 const SAVE_AFTER: f64 = 1.0;
 /// How often the host says how it is doing.
 const REPORT_EVERY: f64 = 300.0;
+/// How long a lock's holder may be away from its tab before the host lets it go (the app's
+/// owner waits as long).
+const AWAY: f64 = 3.0;
+/// Someone not heard from this long has left (their presence comes every few seconds).
+const FORGET_AFTER: f64 = 15.0;
 
 pub struct Host {
     dir: PathBuf,
@@ -99,6 +108,33 @@ struct Hosted {
     meta: DocumentMeta,
     /// When the first edit not saved yet was numbered.
     unsaved: Option<f64>,
+    /// The tabs someone has open for themselves: each with its holder's cadrs ID and name.
+    locks: Vec<(ElementId, String, String)>,
+    /// Since when each lock's holder has been away from its tab.
+    away: Vec<(ElementId, f64)>,
+    /// The tab each peer in the room is in, by cadrs ID, and when they were last heard from.
+    present: HashMap<String, (Option<ElementId>, f64)>,
+}
+
+impl Hosted {
+    /// The holder of the lock on `key`'s tab, when it is someone other than `by`: their name.
+    fn held_against(&self, key: Key, by: &str) -> Option<&str> {
+        let element = match key {
+            Key::Head => return None,
+            Key::Element(e) | Key::Shell(e) | Key::Feature(e, _) => e,
+        };
+        self.locks
+            .iter()
+            .find(|(e, id, _)| *e == element && id != by)
+            .map(|(.., name)| name.as_str())
+    }
+
+    fn locks_changed(&self, document: DocumentId) -> Outgoing {
+        Outgoing::Locks(LocksChanged {
+            document,
+            locks: self.locks.clone(),
+        })
+    }
 }
 
 /// The documents the host owns, by id.
@@ -115,6 +151,7 @@ enum Outgoing {
     Edit(Sequenced),
     Version(VersionCreated),
     Comment(CommentChanged),
+    Locks(LocksChanged),
 }
 
 /// Messages on their way to their rooms.
@@ -172,7 +209,10 @@ pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, rel
         open: HashMap::new(),
     })
     .init_resource::<Outbox>()
-    .add_systems(Update, (scan, serve, send, save, report).chain());
+    .add_systems(
+        Update,
+        (scan, hear, serve, release_left, send, save, report).chain(),
+    );
 }
 
 fn now(world: &World) -> f64 {
@@ -275,6 +315,9 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
                 log,
                 meta: file.meta,
                 unsaved: None,
+                locks: Vec::new(),
+                away: Vec::new(),
+                present: HashMap::new(),
             },
         );
     }
@@ -323,6 +366,7 @@ fn serve(world: &mut World) {
             Ask::Propose { .. } => propose(world, r),
             Ask::Comment(_) => comment(world, r),
             Ask::CreateVersion { .. } => version(world, r),
+            Ask::Lock { .. } | Ask::Unlock { .. } => lock(world, r),
             Ask::Status => {
                 let open = hosted(world, &r).is_ok();
                 r.verdict(Verdict::Accepted(open as u64))
@@ -396,6 +440,17 @@ fn propose(world: &mut World, r: Request) {
     };
     if h.epoch != epoch {
         return r.verdict(Verdict::Resync);
+    }
+    // A tab someone else has open for themselves.
+    if let Some(name) = change
+        .footprint()
+        .0
+        .iter()
+        .find_map(|k| h.held_against(*k, &author))
+    {
+        return r.verdict(Verdict::Refused(format!(
+            "{name} has that tab open: your change was undone"
+        )));
     }
     let verdict = match h.seq.admit(&author, base, change.clone(), &mut h.confirmed) {
         Ok((seq, change)) => {
@@ -557,6 +612,142 @@ fn version(world: &mut World, r: Request) {
     r.verdict(Verdict::Accepted(0));
 }
 
+/// Where each peer is, from their presence; and the locks again for whoever joins a room (a
+/// lock taken before they came would otherwise reach them only when it changes).
+fn hear(
+    mut presence: MessageReader<Received<Presence>>,
+    mut joined: MessageReader<PeerJoined>,
+    time: Res<Time<bevy::time::Real>>,
+    mut docs: ResMut<Documents>,
+    mut outbox: ResMut<Outbox>,
+) {
+    let t = time.elapsed_secs_f64();
+    for m in presence.read() {
+        if let Some(h) = docs
+            .open
+            .get_mut(&m.msg.document)
+            .filter(|h| h.room == m.room)
+        {
+            h.present.insert(m.from.to_string(), (m.msg.tab, t));
+        }
+    }
+    for j in joined.read() {
+        if let Some((id, h)) = docs
+            .open
+            .iter()
+            .find(|(_, h)| h.room == j.room && !h.locks.is_empty())
+        {
+            outbox.0.push((h.room, h.locks_changed(*id)));
+        }
+    }
+    for h in docs.open.values_mut() {
+        h.present.retain(|_, (_, heard)| t - *heard < FORGET_AFTER);
+    }
+}
+
+/// **Open tab, close it for other users**, and giving it back, from someone who may edit.
+/// Taking a tab someone else holds needs `take` (**Take over**); only its holder gives it back.
+fn lock(world: &mut World, r: Request) {
+    let from = r.from.to_string();
+    match hosted(world, &r) {
+        Ok(h)
+            if h.meta.sharing.as_ref().and_then(|s| s.permission(&from))
+                != Some(Permission::Edit) =>
+        {
+            return r.verdict(Verdict::Refused(
+                "You have view access to this document".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(why) => return r.refuse(why),
+    }
+    let name = peer_name(world, r.from);
+    let t = now(world);
+    let mut docs = world.resource_mut::<Documents>();
+    let Some(h) = docs.open.get_mut(&r.document) else {
+        return r.verdict(Verdict::Closed);
+    };
+    let (element, holder, take) = match r.ask {
+        Ask::Lock { element, take } => (element, Some((from.clone(), name)), take),
+        Ask::Unlock { element } => (element, None, false),
+        _ => return,
+    };
+    let current = h.locks.iter().position(|(e, ..)| *e == element);
+    match (holder, current) {
+        (Some((id, name)), Some(i)) => {
+            let (_, held_by, held_name) = &h.locks[i];
+            if *held_by != id && !take {
+                let why = format!("{held_name} has this tab open");
+                return r.verdict(Verdict::Refused(why));
+            }
+            h.locks[i] = (element, id, name);
+        }
+        (Some((id, name)), None) => h.locks.push((element, id, name)),
+        // Only its holder gives a tab back; anyone else's Unlock changes nothing.
+        (None, Some(i)) if h.locks[i].1 == from => {
+            h.locks.remove(i);
+        }
+        (None, _) => return r.verdict(Verdict::Accepted(0)),
+    }
+    h.away.retain(|(e, _)| *e != element);
+    // (Just asked for: the holder is in that tab, whatever their last presence said.)
+    if h.locks
+        .iter()
+        .any(|(e, id, _)| *e == element && *id == from)
+    {
+        h.present.insert(from, (Some(element), t));
+    }
+    let (room, m) = (h.room, h.locks_changed(r.document));
+    world.resource_mut::<Outbox>().0.push((room, m));
+    r.verdict(Verdict::Accepted(0));
+}
+
+/// Lets a lock go when its holder has been away from its tab (or the document) for a while.
+fn release_left(
+    time: Res<Time<bevy::time::Real>>,
+    mut docs: ResMut<Documents>,
+    mut outbox: ResMut<Outbox>,
+) {
+    let t = time.elapsed_secs_f64();
+    for (id, h) in docs.open.iter_mut() {
+        if h.locks.is_empty() {
+            continue;
+        }
+        let mut gone = Vec::new();
+        for (element, holder, _) in &h.locks {
+            let there = h
+                .present
+                .get(holder)
+                .is_some_and(|(tab, _)| *tab == Some(*element));
+            if there {
+                h.away.retain(|(e, _)| e != element);
+                continue;
+            }
+            let since = match h.away.iter().find(|(e, _)| e == element) {
+                Some((_, s)) => *s,
+                None => {
+                    h.away.push((*element, t));
+                    t
+                }
+            };
+            if t - since > AWAY {
+                gone.push(*element);
+            }
+        }
+        if gone.is_empty() {
+            continue;
+        }
+        h.locks.retain(|(e, ..)| !gone.contains(e));
+        h.away.retain(|(e, _)| !gone.contains(e));
+        info!(
+            "let {} tab(s) of {} go: their holders left",
+            gone.len(),
+            h.name
+        );
+        outbox.0.push((h.room, h.locks_changed(*id)));
+    }
+}
+
 fn send(mut outbox: ResMut<Outbox>, net: NetSender) {
     for (room, m) in outbox.0.drain(..) {
         match m {
@@ -567,6 +758,9 @@ fn send(mut outbox: ResMut<Outbox>, net: NetSender) {
                 net.broadcast(room, &m);
             }
             Outgoing::Comment(m) => {
+                net.broadcast(room, &m);
+            }
+            Outgoing::Locks(m) => {
                 net.broadcast(room, &m);
             }
         }
