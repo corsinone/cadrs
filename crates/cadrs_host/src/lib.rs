@@ -28,6 +28,10 @@
 //! in `host.ron` in its data dir, added with `--admin`): they share the document with the host
 //! and transfer it, and the host sends everyone it is shared with the new link. Anyone else's
 //! transfers, and links shared with the host by anyone but an admin, are refused.
+//!
+//! The host stays out of the public room (public documents, the check-in at peers.cadrs.net)
+//! unless an admin turns it on (`--public on`, kept in `host.ron`): it is there for the team's
+//! private documents, and the seed peer does the public ones.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,6 +73,8 @@ pub struct Host {
     name: String,
     /// cadrs IDs to add to the admins.
     admins: Vec<String>,
+    /// `--public on|off`: to change whether the host is in the public room.
+    public: Option<bool>,
 }
 
 /// The host's settings, in its data dir.
@@ -80,6 +86,10 @@ struct Settings {
     /// Who may give the host documents (Transfer ownership): their cadrs IDs.
     #[serde(default)]
     admins: Vec<String>,
+    /// Whether the host takes part in public documents (the public room); off unless an admin
+    /// turns it on.
+    #[serde(default)]
+    public: bool,
 }
 
 fn read_settings(dir: &Path) -> Result<Settings, String> {
@@ -95,11 +105,21 @@ fn read_settings(dir: &Path) -> Result<Settings, String> {
 pub fn add_admin(dir: &Path, id: &str) -> Result<(), String> {
     id.parse::<EndpointId>()
         .map_err(|_| format!("{id} is not a cadrs ID"))?;
+    edit_settings(dir, |s| {
+        if !s.admins.iter().any(|a| a == id) {
+            s.admins.push(id.to_string());
+        }
+    })
+}
+
+/// Turns the public room on or off for the host whose data dir is `dir`.
+pub fn set_public(dir: &Path, on: bool) -> Result<(), String> {
+    edit_settings(dir, |s| s.public = on)
+}
+
+fn edit_settings(dir: &Path, f: impl FnOnce(&mut Settings)) -> Result<(), String> {
     let mut settings = read_settings(dir)?;
-    if settings.admins.iter().any(|a| a == id) {
-        return Ok(());
-    }
-    settings.admins.push(id.to_string());
+    f(&mut settings);
     let text = ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default())
         .map_err(|e| e.to_string())?;
     let path = dir.join(SETTINGS_FILE);
@@ -114,6 +134,7 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
     let mut dir = std::env::var_os("CADRS_DATA_DIR").map(PathBuf::from);
     let mut name = "cadrs host".to_string();
     let mut admins = Vec::new();
+    let mut public = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -130,9 +151,14 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
                 Some(id) => admins.push(id.trim().to_string()),
                 None => return Some(Err("--admin needs a cadrs ID".into())),
             },
+            "--public" => match it.next().map(String::as_str) {
+                Some("on") => public = Some(true),
+                Some("off") => public = Some(false),
+                _ => return Some(Err("--public needs on or off".into())),
+            },
             other => {
                 return Some(Err(format!(
-                    "{other}: a host takes only --data-dir, --name and --admin"
+                    "{other}: a host takes only --data-dir, --name, --admin and --public"
                 )));
             }
         }
@@ -141,7 +167,12 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
         Store::default_root().map(|r| r.parent().map_or(r.clone(), |p| p.join("host")))
     });
     Some(match dir {
-        Some(dir) => Ok(Host { dir, name, admins }),
+        Some(dir) => Ok(Host {
+            dir,
+            name,
+            admins,
+            public,
+        }),
         None => Err("No data dir: give one with --data-dir".into()),
     })
 }
@@ -275,13 +306,20 @@ pub fn run(host: Host) -> AppExit {
             return AppExit::from_code(2);
         }
     }
-    let admins = match read_settings(&host.dir) {
-        Ok(s) => s.admins,
+    if let Some(on) = host.public
+        && let Err(e) = set_public(&host.dir, on)
+    {
+        eprintln!("{e}");
+        return AppExit::from_code(2);
+    }
+    let settings = match read_settings(&host.dir) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
             return AppExit::from_code(2);
         }
     };
+    let admins = settings.admins;
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
@@ -303,6 +341,9 @@ pub fn run(host: Host) -> AppExit {
                 println!("No admins yet: add one with --admin <cadrs ID> to give it documents.");
             } else {
                 println!("Admins: {}", admins.join(", "));
+            }
+            if settings.public {
+                println!("In the public room (--public off to leave it).");
             }
         }
         None => {
@@ -327,10 +368,13 @@ pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, rel
         relays,
         autostart: true,
     });
-    let admins = read_settings(dir).map(|s| s.admins).unwrap_or_else(|e| {
+    let settings = read_settings(dir).unwrap_or_else(|e| {
         error!("{e}");
-        Vec::new()
+        Settings::default()
     });
+    // (After the network, which turns public documents on.)
+    app.insert_resource(cadrs_net::public::PublicEnabled(settings.public));
+    let admins = settings.admins;
     app.insert_resource(Documents {
         store: Store::new(dir),
         name: name.into(),

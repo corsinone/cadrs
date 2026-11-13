@@ -3,7 +3,8 @@
 //! kept to what they may do, the editor makes a version and the viewer comments, and all of it
 //! is on disk afterwards: the document, its history log and its comments. Then two editors and
 //! a tab one of them has open for themselves; members added, sent the link, and leaving; a
-//! document handed back after the host was away; and one an admin gives the host.
+//! document handed back after the host was away; one an admin gives the host; and the public
+//! room, which the host stays out of unless it is turned on.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -492,5 +493,24 @@ fn an_admin_gives_the_host_a_document_and_everyone_follows_it() {
     let welcome = fetch(&mut host, &mut olga, &link).unwrap();
     assert_eq!(welcome.access.permission, Permission::Edit);
     assert!(fetch(&mut host, &mut sam, &link).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_host_stays_out_of_the_public_room_unless_turned_on() {
+    let dir = temp_dir();
+    let in_public_room = |dir: &Path| {
+        let mut host = App::new();
+        host.add_plugins(MinimalPlugins);
+        cadrs_host::add(&mut host, dir, "Team host", None, Relays::Disabled);
+        host.world()
+            .resource::<cadrs_net::public::PublicEnabled>()
+            .0
+    };
+    assert!(!in_public_room(&dir));
+    cadrs_host::set_public(&dir, true).unwrap();
+    assert!(in_public_room(&dir));
+    cadrs_host::set_public(&dir, false).unwrap();
+    assert!(!in_public_room(&dir));
     let _ = std::fs::remove_dir_all(&dir);
 }
