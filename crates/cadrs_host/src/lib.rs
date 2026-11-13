@@ -20,8 +20,9 @@
 //! lock go when its holder has left the tab. Whoever may share asks it to add people, and
 //! members leave; everyone in the room hears the new access, and each member is sent the link
 //! until their cadrs takes it (as the owner's app does while the document is open). It
-//! answers Join, Propose, Status, Comment, CreateVersion, Lock, Unlock, AddMember and Leave;
-//! handover and transfers are refused for now.
+//! answers Join, Propose, Status, Comment, CreateVersion, Lock, Unlock, AddMember and Leave,
+//! and takes documents back by Handover from whoever kept the edits in order while the host
+//! was away; transfers are refused for now.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ use std::time::Duration;
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use cadrs_core::collab::comments::{CommentOp, Comments};
-use cadrs_core::collab::sync::{Key, Refusal, Sequencer};
+use cadrs_core::collab::sync::{Change, Key, Refusal, Sequencer};
 use cadrs_core::collab::{Member, Permission, Snapshot};
 use cadrs_core::history_log::{HistoryLog, Origin, VersionId, document_hash};
 use cadrs_core::library::DocumentMeta;
@@ -124,6 +125,37 @@ struct Hosted {
 }
 
 impl Hosted {
+    /// Numbers `change` (made on edit `base`) by `author`: it goes into the history log, is
+    /// saved soon, and is what the room is told.
+    fn number(
+        &mut self,
+        document: DocumentId,
+        (author, author_name): (&str, &str),
+        id: u64,
+        base: u64,
+        change: Change,
+        t: f64,
+    ) -> Result<(u64, Outgoing), Refusal> {
+        let (seq, change) = self.seq.admit(author, base, change, &mut self.confirmed)?;
+        let m = Sequenced::new(
+            document,
+            self.epoch,
+            seq,
+            (author, author_name),
+            id,
+            &change,
+            document_hash(&self.confirmed),
+        );
+        self.log.record(
+            &self.confirmed,
+            Origin::Command(String::new()),
+            unix_now(),
+            author_name,
+        );
+        self.unsaved.get_or_insert(t);
+        Ok((seq, Outgoing::Edit(m)))
+    }
+
     /// The holder of the lock on `key`'s tab, when it is someone other than `by`: their name.
     fn held_against(&self, key: Key, by: &str) -> Option<&str> {
         let element = match key {
@@ -403,6 +435,7 @@ fn serve(world: &mut World) {
             Ask::CreateVersion { .. } => version(world, r),
             Ask::Lock { .. } | Ask::Unlock { .. } => lock(world, r),
             Ask::AddMember { .. } | Ask::Leave => membership(world, r),
+            Ask::Handover(_) => handover(world, r),
             Ask::Status => {
                 let open = hosted(world, &r).is_ok();
                 r.verdict(Verdict::Accepted(open as u64))
@@ -488,29 +521,17 @@ fn propose(world: &mut World, r: Request) {
             "{name} has that tab open: your change was undone"
         )));
     }
-    let verdict = match h.seq.admit(&author, base, change.clone(), &mut h.confirmed) {
-        Ok((seq, change)) => {
-            let m = Sequenced::new(
-                r.document,
-                h.epoch,
-                seq,
-                (&author, &author_name),
-                id,
-                &change,
-                document_hash(&h.confirmed),
-            );
-            h.log.record(
-                &h.confirmed,
-                Origin::Command(String::new()),
-                unix_now(),
-                &author_name,
-            );
-            h.unsaved.get_or_insert(t);
+    let verdict = match h.number(
+        r.document,
+        (&author, &author_name),
+        id,
+        base,
+        change.clone(),
+        t,
+    ) {
+        Ok((seq, m)) => {
             let room = h.room;
-            world
-                .resource_mut::<Outbox>()
-                .0
-                .push((room, Outgoing::Edit(m)));
+            world.resource_mut::<Outbox>().0.push((room, m));
             Verdict::Accepted(seq)
         }
         Err(Refusal::Conflict { author: first, .. }) => {
@@ -523,6 +544,51 @@ fn propose(world: &mut World, r: Request) {
         Err(Refusal::Stale) => Verdict::Resync,
     };
     r.verdict(verdict);
+}
+
+/// From the editor who kept the edits in order while the host was away (down, or not started
+/// yet): the document as it is now, taken on as one edit by them, as the owner's app does
+/// when it is back. Everyone then follows the host again.
+fn handover(world: &mut World, r: Request) {
+    let Ask::Handover(snapshot) = &r.ask else {
+        return;
+    };
+    let author = r.from.to_string();
+    match hosted(world, &r) {
+        Ok(h)
+            if h.meta.sharing.as_ref().and_then(|s| s.permission(&author))
+                != Some(Permission::Edit) =>
+        {
+            return r.verdict(Verdict::Refused("Not taken".into()));
+        }
+        Ok(_) => {}
+        Err(why) => return r.refuse(why),
+    }
+    let doc = match snapshot.clone().install() {
+        Ok(d) if d.id == r.document => d,
+        _ => return r.verdict(Verdict::Refused("Not this document".into())),
+    };
+    let author_name = peer_name(world, r.from);
+    let t = now(world);
+    let mut docs = world.resource_mut::<Documents>();
+    let Some(h) = docs.open.get_mut(&r.document) else {
+        return r.verdict(Verdict::Closed);
+    };
+    if *h.confirmed == doc {
+        return r.verdict(Verdict::Accepted(0));
+    }
+    let change = Change::between(&h.confirmed, &doc);
+    let base = h.seq.seq();
+    match h.number(r.document, (&author, &author_name), 0, base, change, t) {
+        Ok((_, m)) => {
+            *h.confirmed = doc;
+            info!("took {} back from {author_name}", h.name);
+            let room = h.room;
+            world.resource_mut::<Outbox>().0.push((room, m));
+            r.verdict(Verdict::Accepted(0));
+        }
+        Err(_) => r.verdict(Verdict::Refused("Not taken".into())),
+    }
 }
 
 /// A comment from someone the document is shared with, kept next to it and passed on to the

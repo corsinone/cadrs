@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use bevy::prelude::*;
 use cadrs_core::collab::comments::{Comment, CommentOp, Comments};
 use cadrs_core::collab::sync::Change;
-use cadrs_core::collab::{Access, Member, Permission, Rights, Sharing};
+use cadrs_core::collab::{Access, Member, Permission, Rights, Sharing, Snapshot};
 use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, Store};
@@ -390,5 +390,43 @@ fn whoever_may_share_adds_people_who_get_the_link_and_may_leave() {
         Ok(Verdict::Accepted(0))
     );
     assert!(fetch(&mut host, &mut ned, &link).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_host_takes_back_what_an_editor_kept_while_it_was_away() {
+    let mut ann = peer("Ann");
+    let mut vic = peer("Vic");
+    let dir = temp_dir();
+    let doc = Document::new("Frame");
+    let members = vec![
+        member(&ann, "Ann", Permission::Edit),
+        member(&vic, "Vic", Permission::View),
+    ];
+    let (mut host, link) = host_with(&dir, &doc, members);
+
+    // What Ann kept in order while the host was down: the frame renamed.
+    let mut kept = doc.clone();
+    kept.name = "Frame (edited offline)".into();
+    let snapshot = Snapshot {
+        seq: 0,
+        document: kept,
+        blobs: Vec::new(),
+    };
+
+    // Someone who may only view can't hand it over; Ann can, and it is the host's again.
+    let task = transfer::start_handover(vic.world().resource::<Iroh>(), &link, &snapshot);
+    assert!(matches!(
+        wait(&mut [&mut host, &mut vic], task),
+        Ok(Verdict::Refused(_))
+    ));
+    let task = transfer::start_handover(ann.world().resource::<Iroh>(), &link, &snapshot);
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(0))
+    );
+    let seen = fetch(&mut host, &mut vic, &link).unwrap();
+    assert_eq!(seen.snapshot.document.name, "Frame (edited offline)");
+    assert_eq!(seen.snapshot.seq, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
