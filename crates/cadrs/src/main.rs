@@ -18,6 +18,9 @@
 //! `cadrs --public-seed [--data-dir <dir>] [--peer <cadrs ID>]…` runs a seed peer for public
 //! documents, with no window (see [`seed`]).
 //!
+//! `cadrs --host [--data-dir <dir>]…` runs the always-online owner of a team's documents, with
+//! no window, and `cadrs --host-user`… look after its users and documents ([`cadrs_host`]).
+//!
 //! `cadrs --kernel-process <port> <token>` is the geometry kernel the app starts for itself
 //! (`cadrs_core::rebuild::process`); `CADRS_KERNEL=thread` keeps the kernel in the app instead.
 //!
@@ -83,12 +86,24 @@ Usage:
       Runs a seed peer for public documents without a window: it stays in the public room and
       keeps every listing, star and published document, for others to start from. Its data dir
       defaults to ~/.local/share/cadrs/seed; it prints its cadrs ID.
-  cadrs --host [--data-dir <dir>] [--name <name>] [--admin <cadrs ID>]... [--public on|off]
+  cadrs --host [--data-dir <dir>] [--name <name>] [--public on|off]
       Runs a host without a window: the always-online owner of the shared documents in its
       data dir. It keeps their rooms, sends them to whoever may join and numbers everyone's
-      edits. Its admins (kept in host.ron; --admin adds one) give it documents with Transfer
-      ownership. It stays out of the public room unless --public on (also kept). Its data
-      dir defaults to ~/.local/share/cadrs/host; it prints its cadrs ID.
+      edits. It answers only its users (users.ron, below); its maintainers and admins give it
+      documents with Transfer ownership. It stays out of the public room unless --public on
+      (kept in host.ron). Its data dir defaults to ~/.local/share/cadrs/host; it prints its
+      cadrs ID.
+  cadrs --host-users [--data-dir <dir>]
+      Lists a host's users: name, role (admin, maintainer, collaborator), sign-in, cadrs IDs.
+  cadrs --host-user <name> [--role <role>] [--sign-in <address>] [--id <cadrs ID>]...
+        [--forget-id <cadrs ID>]... [--rename <new name>] [--remove] [--data-dir <dir>]
+      Adds a user to a host (a collaborator unless --role says), or changes or removes one;
+      a running host takes it within seconds. A person has a cadrs ID for each device.
+  cadrs --host-documents [--data-dir <dir>]
+      Lists a host's documents with their maintainers and whom they are shared with.
+  cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...
+        [--data-dir <dir>]
+      Shows one of a host's documents, after making users its maintainers or no longer.
   cadrs --install
       Installs this build for the current user, with a launcher entry (Linux, macOS, Windows;
       `cargo install-local`).
@@ -155,6 +170,16 @@ fn main() -> AppExit {
             Err(e) => {
                 eprintln!("{e}");
                 AppExit::from_code(1)
+            }
+        };
+    }
+    // `--host-users`, `--host-user`...: a host's users and documents, and its backup.
+    if let Some(a) = cadrs_host::admin::parse(&args) {
+        return match a {
+            Ok(a) => AppExit::from_code(cadrs_host::admin::run(a)),
+            Err(e) => {
+                eprintln!("{e}");
+                AppExit::from_code(2)
             }
         };
     }

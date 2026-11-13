@@ -3,8 +3,9 @@
 //! kept to what they may do, the editor makes a version and the viewer comments, and all of it
 //! is on disk afterwards: the document, its history log and its comments. Then two editors and
 //! a tab one of them has open for themselves; members added, sent the link, and leaving; a
-//! document handed back after the host was away; one an admin gives the host; and the public
-//! room, which the host stays out of unless it is turned on; and a restart.
+//! document handed back after the host was away; one a maintainer gives the host; the public
+//! room, which the host stays out of unless it is turned on; a restart; the host's users, the
+//! only ones it answers, and the commands that change them.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use cadrs_core::collab::{Access, Member, Permission, Rights, Sharing, Snapshot};
 use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, Store};
+use cadrs_host::users::{Role, User, Users};
 use cadrs_net::bevy_iroh::{Iroh, IrohTask, Relays};
 use cadrs_net::{Ask, NetPlugin, Ownership, Requests, ShareLink, Verdict, Welcome, transfer};
 
@@ -48,6 +50,21 @@ fn member(app: &App, name: &str, permission: Permission) -> Member {
         rights: None,
         delivered: None,
     }
+}
+
+/// Makes `app`'s owner a user of the host in `dir`, called `name`.
+fn user(dir: &Path, app: &App, name: &str, role: Role) {
+    let id = id_of(app);
+    Users::edit(dir, |u| {
+        u.users.push(User {
+            name: name.into(),
+            role,
+            sign_in: None,
+            ids: vec![id],
+        });
+        Ok(())
+    })
+    .unwrap();
 }
 
 fn wait<T>(apps: &mut [&mut App], mut task: IrohTask<T>) -> T {
@@ -90,8 +107,23 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
-/// A host whose data dir holds `doc`, shared with `members`; and the link to it.
+/// A host whose data dir holds `doc`, shared with `members` (all of them its users); and the
+/// link to it.
 fn host_with(dir: &Path, doc: &Document, members: Vec<Member>) -> (App, ShareLink) {
+    Users::edit(dir, |u| {
+        for m in &members {
+            if u.by_id(&m.id).is_none() {
+                u.users.push(User {
+                    name: m.name.clone(),
+                    role: Role::Collaborator,
+                    sign_in: None,
+                    ids: vec![m.id.clone()],
+                });
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
     let mut meta = DocumentMeta::new("host", 0);
     let mut sharing = Sharing::new(TOPIC);
     sharing.members = members;
@@ -197,7 +229,7 @@ fn the_host_sends_its_document_numbers_edits_and_saves_them() {
         Ok(Verdict::Refused(_))
     ));
 
-    // Someone the document is not shared with gets nothing, nor does a wrong room.
+    // Someone the host doesn't know gets nothing, nor does a wrong room.
     assert!(fetch(&mut host, &mut stranger, &link).is_err());
     let wrong = ShareLink {
         topic: [0; 32],
@@ -315,9 +347,14 @@ fn whoever_may_share_adds_people_who_get_the_link_and_may_leave() {
     let mut ann = peer("Ann");
     let mut vic = peer("Vic");
     let mut ned = peer("Ned");
+    let mut mia = peer("Mia");
     let dir = temp_dir();
     let store = Store::new(&dir);
     let doc = Document::new("Frame");
+    // Ned is a user the document isn't shared with yet; Mia maintains it, unshared too.
+    user(&dir, &ned, "Ned", Role::Collaborator);
+    user(&dir, &mia, "Mia", Role::Maintainer);
+    Users::edit(&dir, |u| u.set_maintainer(doc.id, "Mia", true)).unwrap();
     let members = vec![
         member(&ann, "Ann", Permission::Edit),
         member(&vic, "Vic", Permission::View),
@@ -343,6 +380,20 @@ fn whoever_may_share_adds_people_who_get_the_link_and_may_leave() {
     let task = transfer::start_add_member(iroh, &link, id_of(&ned), "Ned".into(), edit);
     assert_eq!(
         wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(0))
+    );
+    // Nobody adds someone who isn't a user; Mia, who maintains it, shares it as she likes.
+    let quinn = cadrs_net::bevy_iroh::iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let iroh = mia.world().resource::<Iroh>();
+    let task = transfer::start_add_member(iroh, &link, quinn.to_string(), "Quinn".into(), edit);
+    assert!(matches!(
+        wait(&mut [&mut host, &mut mia], task),
+        Ok(Verdict::Refused(_))
+    ));
+    let iroh = mia.world().resource::<Iroh>();
+    let task = transfer::start_add_member(iroh, &link, id_of(&vic), "Vic".into(), edit);
+    assert_eq!(
+        wait(&mut [&mut host, &mut mia], task),
         Ok(Verdict::Accepted(0))
     );
 
@@ -434,13 +485,14 @@ fn the_host_takes_back_what_an_editor_kept_while_it_was_away() {
 }
 
 #[test]
-fn an_admin_gives_the_host_a_document_and_everyone_follows_it() {
+fn a_maintainer_gives_the_host_a_document_and_everyone_follows_it() {
     let mut olga = peer("Olga");
     let mut pat = peer("Pat");
     let mut sam = peer("Sam");
     let dir = temp_dir();
-    cadrs_host::add_admin(&dir, &id_of(&olga)).unwrap();
-    assert!(cadrs_host::add_admin(&dir, "not an ID").is_err());
+    user(&dir, &olga, "Olga", Role::Maintainer);
+    user(&dir, &pat, "Pat", Role::Collaborator);
+    user(&dir, &sam, "Sam", Role::Collaborator);
     let mut host = App::new();
     host.add_plugins(MinimalPlugins);
     cadrs_host::add(&mut host, &dir, "Team host", None, Relays::Disabled);
@@ -471,7 +523,7 @@ fn an_admin_gives_the_host_a_document_and_everyone_follows_it() {
     assert!(fetch(&mut host, &mut olga, &link).is_err());
     assert!(fetch(&mut host, &mut sam, &link).is_err());
 
-    // Sam, who is not an admin, can't; Olga can.
+    // Sam, a collaborator, can't; Olga, a maintainer, can.
     let iroh = sam.world().resource::<Iroh>();
     let task = transfer::start_transfer(iroh, host_addr.id, &link, &ownership);
     assert!(matches!(
@@ -493,6 +545,9 @@ fn an_admin_gives_the_host_a_document_and_everyone_follows_it() {
     let welcome = fetch(&mut host, &mut olga, &link).unwrap();
     assert_eq!(welcome.access.permission, Permission::Edit);
     assert!(fetch(&mut host, &mut sam, &link).is_err());
+    // And Olga maintains it.
+    let users = Users::read(&dir).unwrap();
+    assert_eq!(users.maintainers_of(doc.id), ["Olga"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -553,5 +608,139 @@ fn a_host_stopped_and_started_again_has_everything() {
         .unwrap()
         .unwrap();
     assert_eq!(log.head().name, "Frame v2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_host_answers_only_its_users_and_takes_new_ones_as_they_come() {
+    let mut ann = peer("Ann");
+    let mut zoe = peer("Zoe");
+    let dir = temp_dir();
+    let doc = Document::new("Frame");
+    let (mut host, link) = host_with(&dir, &doc, vec![member(&ann, "Ann", Permission::Edit)]);
+    // Link sharing on: anyone with the link may edit, if the host knows them.
+    let mut meta = Store::new(&dir).load(doc.id).unwrap().meta;
+    meta.sharing.as_mut().unwrap().link = Some(Permission::Edit);
+    Store::new(&dir).save(&doc, &meta).unwrap();
+    let welcome = fetch(&mut host, &mut ann, &link).unwrap();
+
+    // Zoe has the link, but isn't a user: she gets nothing, and may do nothing.
+    let refused = fetch(&mut host, &mut zoe, &link).unwrap_err();
+    assert!(refused.contains("doesn't know"), "{refused}");
+    let mut d = doc.clone();
+    d.name = "Zoe's".into();
+    let iroh = zoe.world().resource::<Iroh>();
+    let task =
+        transfer::start_propose(iroh, &link, welcome.epoch, 1, 0, &Change::between(&doc, &d));
+    assert!(matches!(
+        wait(&mut [&mut host, &mut zoe], task),
+        Ok(Verdict::Refused(_))
+    ));
+
+    // Made a user while the host runs, she opens it within seconds, with the link's access.
+    user(&dir, &zoe, "Zoe", Role::Collaborator);
+    let start = Instant::now();
+    let welcome = loop {
+        if let Ok(w) = fetch(&mut host, &mut zoe, &link) {
+            break w;
+        }
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the host never took the new user"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(welcome.access.permission, Permission::Edit);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cadrs <args> --data-dir <dir>`, for one of the commands: its exit code.
+fn command(dir: &Path, args: &[&str]) -> u8 {
+    let mut args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    args.extend(["--data-dir".to_string(), dir.display().to_string()]);
+    match cadrs_host::admin::parse(&args) {
+        Some(Ok(a)) => cadrs_host::admin::run(a),
+        Some(Err(e)) => panic!("{e}"),
+        None => panic!("not a command: {args:?}"),
+    }
+}
+
+#[test]
+fn the_commands_look_after_users_and_maintainers() {
+    let dir = temp_dir();
+    let doc = Document::new("Bracket");
+    Store::new(&dir)
+        .create(&doc, &DocumentMeta::new("host", 0))
+        .unwrap();
+    let key = |n: u8| {
+        cadrs_net::bevy_iroh::iroh::SecretKey::from_bytes(&[n; 32])
+            .public()
+            .to_string()
+    };
+    let (laptop, browser) = (key(1), key(2));
+
+    // A maintainer with two cadrs IDs, and a collaborator.
+    let id = laptop.as_str();
+    let args = ["--host-user", "Max", "--role", "maintainer", "--id", id];
+    assert_eq!(command(&dir, &args), 0);
+    assert_eq!(command(&dir, &["--host-user", "max", "--id", &browser]), 0);
+    assert_eq!(command(&dir, &["--host-user", "Cleo"]), 0);
+    let users = Users::read(&dir).unwrap();
+    assert_eq!(users.role(&browser), Some(Role::Maintainer));
+    assert_eq!(users.by_name("Cleo").unwrap().role, Role::Collaborator);
+    // An ID is one person's; a name is a cadrs ID's only.
+    assert_eq!(command(&dir, &["--host-user", "Cleo", "--id", &laptop]), 1);
+    assert_eq!(command(&dir, &["--host-user", "Cleo", "--id", "nope"]), 1);
+
+    // Max maintains the document, by name; not Cleo, a collaborator.
+    assert_eq!(
+        command(&dir, &["--host-document", "bracket", "--maintainer", "Max"]),
+        0
+    );
+    assert_eq!(
+        command(
+            &dir,
+            &["--host-document", "Bracket", "--maintainer", "Cleo"]
+        ),
+        1
+    );
+    assert_eq!(command(&dir, &["--host-document", "Nothing"]), 1);
+    assert!(Users::read(&dir).unwrap().maintains(&laptop, doc.id));
+    assert_eq!(command(&dir, &["--host-documents"]), 0);
+    assert_eq!(command(&dir, &["--host-users"]), 0);
+
+    // Renamed, still the maintainer; made a collaborator, no longer; then removed.
+    assert_eq!(
+        command(&dir, &["--host-user", "Max", "--rename", "Maxine"]),
+        0
+    );
+    let users = Users::read(&dir).unwrap();
+    assert_eq!(users.maintainers_of(doc.id), ["Maxine"]);
+    let args = [
+        "--host-user",
+        "Maxine",
+        "--role",
+        "collaborator",
+        "--forget-id",
+        id,
+    ];
+    assert_eq!(command(&dir, &args), 0);
+    let users = Users::read(&dir).unwrap();
+    assert!(users.maintainers.is_empty());
+    assert_eq!(
+        users.by_name("Maxine").unwrap().ids,
+        std::slice::from_ref(&browser)
+    );
+    assert_eq!(command(&dir, &["--host-user", "Maxine", "--remove"]), 0);
+    assert!(Users::read(&dir).unwrap().by_id(&browser).is_none());
+
+    // Options that don't go with the command, and no command.
+    let bad = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        matches!(cadrs_host::admin::parse(&args), Some(Err(_)))
+    };
+    assert!(bad(&["--host-users", "--role", "admin"]));
+    assert!(bad(&["--host-user", "Ada", "--role", "boss"]));
+    assert!(cadrs_host::admin::parse(&["--host".to_string()]).is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }

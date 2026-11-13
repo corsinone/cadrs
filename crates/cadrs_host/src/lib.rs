@@ -24,14 +24,21 @@
 //! and takes documents back by Handover from whoever kept the edits in order while the host
 //! was away.
 //!
-//! Documents come to the host by **Transfer ownership** from one of its admins (the cadrs IDs
-//! in `host.ron` in its data dir, added with `--admin`): they share the document with the host
-//! and transfer it, and the host sends everyone it is shared with the new link. Anyone else's
-//! transfers, and links shared with the host by anyone but an admin, are refused.
+//! It answers only its users ([`users`]: `users.ron` in its data dir, edited with
+//! `cadrs --host-user`), people with a role and the cadrs IDs they use; anyone else is refused
+//! whatever they ask, link or no link, and isn't sent links either. Documents come to the host
+//! by **Transfer ownership** from a maintainer or an admin: they share the document with the
+//! host and transfer it, the host sends everyone it is shared with the new link, and they
+//! maintain it from then on. The maintainers of a document and the admins may share it with
+//! more people (users only) whatever their own access. [`admin`] has the commands that list
+//! and change all of this.
 //!
 //! The host stays out of the public room (public documents, the check-in at peers.cadrs.net)
 //! unless an admin turns it on (`--public on`, kept in `host.ron`): it is there for the team's
 //! private documents, and the seed peer does the public ones.
+
+pub mod admin;
+pub mod users;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,7 +48,7 @@ use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use cadrs_core::collab::comments::{CommentOp, Comments};
 use cadrs_core::collab::sync::{Change, Key, Refusal, Sequencer};
-use cadrs_core::collab::{Member, Permission, Snapshot};
+use cadrs_core::collab::{Access, Member, Permission, Rights, Snapshot};
 use cadrs_core::history_log::{HistoryLog, Origin, VersionId, document_hash};
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, DocumentId, ElementId, Store};
@@ -52,6 +59,7 @@ use cadrs_net::{
     AccessChanged, Answer, Ask, CommentChanged, Invite, LocksChanged, Presence, Request, Requests,
     Sequenced, ShareLink, Verdict, VersionCreated, Welcome, session, transfer,
 };
+use users::{Role, User, Users};
 
 /// How often the data dir is read again for documents that came, went or changed rooms.
 const SCAN_EVERY: f64 = 5.0;
@@ -71,8 +79,6 @@ const RETRY_INVITES: f64 = 30.0;
 pub struct Host {
     dir: PathBuf,
     name: String,
-    /// cadrs IDs to add to the admins.
-    admins: Vec<String>,
     /// `--public on|off`: to change whether the host is in the public room.
     public: Option<bool>,
 }
@@ -83,8 +89,9 @@ pub const SETTINGS_FILE: &str = "host.ron";
 /// What `host.ron` holds.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Settings {
-    /// Who may give the host documents (Transfer ownership): their cadrs IDs.
-    #[serde(default)]
+    /// The admins' cadrs IDs, of a host from before it had users: they become admins in
+    /// `users.ron` when it starts ([`adopt_admins`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     admins: Vec<String>,
     /// Whether the host takes part in public documents (the public room); off unless an admin
     /// turns it on.
@@ -101,15 +108,35 @@ fn read_settings(dir: &Path) -> Result<Settings, String> {
     ron::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Makes `id` (a cadrs ID) one of the admins of the host whose data dir is `dir`.
-pub fn add_admin(dir: &Path, id: &str) -> Result<(), String> {
-    id.parse::<EndpointId>()
-        .map_err(|_| format!("{id} is not a cadrs ID"))?;
-    edit_settings(dir, |s| {
-        if !s.admins.iter().any(|a| a == id) {
-            s.admins.push(id.to_string());
+/// Makes the admins in `host.ron` of a host from before it had users admin users, named
+/// "Admin 1", "Admin 2"...; their names.
+fn adopt_admins(dir: &Path) -> Result<Vec<String>, String> {
+    let ids = read_settings(dir)?.admins;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (_, names) = Users::edit(dir, |users| {
+        let mut names = Vec::new();
+        for id in ids {
+            if users.by_id(&id).is_some() || id.parse::<EndpointId>().is_err() {
+                continue;
+            }
+            let name = (1..)
+                .map(|n| format!("Admin {n}"))
+                .find(|n| users.by_name(n).is_none())
+                .unwrap_or_default();
+            users.users.push(User {
+                name: name.clone(),
+                role: Role::Admin,
+                sign_in: None,
+                ids: vec![id],
+            });
+            names.push(name);
         }
-    })
+        Ok(names)
+    })?;
+    edit_settings(dir, |s| s.admins.clear())?;
+    Ok(names)
 }
 
 /// Turns the public room on or off for the host whose data dir is `dir`.
@@ -133,7 +160,6 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
     }
     let mut dir = std::env::var_os("CADRS_DATA_DIR").map(PathBuf::from);
     let mut name = "cadrs host".to_string();
-    let mut admins = Vec::new();
     let mut public = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -147,10 +173,6 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
                 Some(n) if !n.trim().is_empty() => name = n.trim().to_string(),
                 _ => return Some(Err("--name needs a name".into())),
             },
-            "--admin" => match it.next() {
-                Some(id) => admins.push(id.trim().to_string()),
-                None => return Some(Err("--admin needs a cadrs ID".into())),
-            },
             "--public" => match it.next().map(String::as_str) {
                 Some("on") => public = Some(true),
                 Some("off") => public = Some(false),
@@ -158,23 +180,21 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
             },
             other => {
                 return Some(Err(format!(
-                    "{other}: a host takes only --data-dir, --name, --admin and --public"
+                    "{other}: a host takes only --data-dir, --name and --public (its users: \
+                     cadrs --host-user)"
                 )));
             }
         }
     }
-    let dir = dir.or_else(|| {
-        Store::default_root().map(|r| r.parent().map_or(r.clone(), |p| p.join("host")))
-    });
-    Some(match dir {
-        Some(dir) => Ok(Host {
-            dir,
-            name,
-            admins,
-            public,
-        }),
+    Some(match dir.or_else(default_dir) {
+        Some(dir) => Ok(Host { dir, name, public }),
         None => Err("No data dir: give one with --data-dir".into()),
     })
+}
+
+/// Where a host keeps everything when no `--data-dir` says: `host` next to the app's documents.
+pub fn default_dir() -> Option<PathBuf> {
+    Store::default_root().map(|r| r.parent().map_or(r.clone(), |p| p.join("host")))
 }
 
 /// One document the host owns and shares: its room, and the numbering of its edits.
@@ -276,8 +296,10 @@ struct Documents {
     open: HashMap<DocumentId, Hosted>,
     /// When to send the links again (seconds on the real clock): 0 sends them at once.
     next_invites: f64,
-    /// Who may give the host documents (`host.ron`).
-    admins: Vec<String>,
+    /// Whom it answers, and what they may do (`users.ron`).
+    users: Users,
+    /// Why `users.ron` could not be read, when it couldn't (said once).
+    users_error: Option<String>,
     /// Look at the data dir now, not at the next scan (a document just came).
     rescan: bool,
 }
@@ -300,8 +322,14 @@ pub fn run(host: Host) -> AppExit {
         eprintln!("cannot use {}: {e}", host.dir.display());
         return AppExit::from_code(2);
     }
-    for id in &host.admins {
-        if let Err(e) = add_admin(&host.dir, id) {
+    match adopt_admins(&host.dir) {
+        Ok(names) if !names.is_empty() => println!(
+            "The admins in host.ron are users now, {}: rename them with \
+             cadrs --host-user <name> --rename <new name>",
+            names.join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => {
             eprintln!("{e}");
             return AppExit::from_code(2);
         }
@@ -319,7 +347,13 @@ pub fn run(host: Host) -> AppExit {
             return AppExit::from_code(2);
         }
     };
-    let admins = settings.admins;
+    let users = match Users::read(&host.dir).and_then(|u| u.check().map(|_| u)) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
+            return AppExit::from_code(2);
+        }
+    };
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
@@ -339,11 +373,21 @@ pub fn run(host: Host) -> AppExit {
                 host.dir.display()
             );
             println!("cadrs ID: {id}");
-            if admins.is_empty() {
-                println!("No admins yet: add one with --admin <cadrs ID> to give it documents.");
-            } else {
-                println!("Admins: {}", admins.join(", "));
+            let count = |role| users.users.iter().filter(|u| u.role == role).count();
+            if count(Role::Admin) == 0 {
+                println!(
+                    "No admins yet: add yourself with cadrs --host-user <your name> --role admin \
+                     --id <your cadrs ID> --data-dir {}",
+                    host.dir.display()
+                );
             }
+            println!(
+                "{} users: {} admins, {} maintainers, {} collaborators",
+                users.users.len(),
+                count(Role::Admin),
+                count(Role::Maintainer),
+                count(Role::Collaborator)
+            );
             if settings.public {
                 println!("In the public room (--public off to leave it).");
             }
@@ -376,13 +420,20 @@ pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, rel
     });
     // (After the network, which turns public documents on.)
     app.insert_resource(cadrs_net::public::PublicEnabled(settings.public));
-    let admins = settings.admins;
+    let (users, users_error) = match Users::read(dir) {
+        Ok(u) => (u, None),
+        Err(e) => {
+            error!("{e}");
+            (Users::default(), Some(e))
+        }
+    };
     app.insert_resource(Documents {
         store: Store::new(dir),
         name: name.into(),
         open: HashMap::new(),
         next_invites: 0.0,
-        admins,
+        users,
+        users_error,
         rescan: false,
     })
     .init_resource::<Outbox>()
@@ -454,6 +505,7 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
     }
     *last = Some(t);
     let store = world.resource::<Documents>().store.clone();
+    read_users(&mut world.resource_mut::<Documents>());
     let (library, errors) = store.list();
     for (path, e) in errors {
         warn!("cannot read {}: {e}", path.display());
@@ -513,6 +565,26 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
     }
 }
 
+/// Takes the users as `users.ron` has them now (an admin may have changed them); keeps the
+/// ones it has when the file can't be read.
+fn read_users(docs: &mut Documents) {
+    match Users::read(docs.store.root()).and_then(|u| u.check().map(|_| u)) {
+        Ok(users) => {
+            if users != docs.users {
+                info!("users changed: {} users now", users.users.len());
+                docs.users = users;
+            }
+            docs.users_error = None;
+        }
+        Err(e) => {
+            if docs.users_error.as_ref() != Some(&e) {
+                error!("{e}; keeping the users as they were");
+                docs.users_error = Some(e);
+            }
+        }
+    }
+}
+
 /// Saves a document if it has edits not saved yet, and leaves its room.
 fn close(world: &mut World, id: DocumentId, store: &Store) {
     let Some(h) = world.resource_mut::<Documents>().open.remove(&id) else {
@@ -551,6 +623,9 @@ fn serve(world: &mut World) {
         return;
     };
     for r in requests {
+        let Some(r) = refuse_strangers(world, r) else {
+            continue;
+        };
         match r.ask {
             Ask::Join => join(world, r),
             Ask::Propose { .. } => propose(world, r),
@@ -566,6 +641,46 @@ fn serve(world: &mut World) {
                 r.verdict(Verdict::Accepted(open as u64))
             }
         }
+    }
+}
+
+/// What the host says to cadrs IDs that aren't its users'.
+const STRANGER: &str = "This host doesn't know your cadrs ID: ask its admin to add it";
+
+/// The request, if it comes from one of the host's users; otherwise refused, whatever it asks.
+fn refuse_strangers(world: &World, r: Request) -> Option<Request> {
+    let from = r.from.to_string();
+    if world.resource::<Documents>().users.by_id(&from).is_some() {
+        return Some(r);
+    }
+    info!(
+        "refused {} of {} to {}: not one of the host's users",
+        asked(&r.ask),
+        r.document,
+        r.from.fmt_short()
+    );
+    match r.ask {
+        Ask::Join | Ask::Status => r.refuse(STRANGER),
+        _ => r.verdict(Verdict::Refused(STRANGER.into())),
+    }
+    None
+}
+
+/// What a request asks, for the log.
+fn asked(ask: &Ask) -> &'static str {
+    match ask {
+        Ask::Join => "Join",
+        Ask::Propose { .. } => "Propose",
+        Ask::Invite(_) => "Invite",
+        Ask::AddMember { .. } => "AddMember",
+        Ask::Leave => "Leave",
+        Ask::Comment(_) => "Comment",
+        Ask::CreateVersion { .. } => "CreateVersion",
+        Ask::Lock { .. } => "Lock",
+        Ask::Unlock { .. } => "Unlock",
+        Ask::Handover(_) => "Handover",
+        Ask::TakeOwnership(_) => "TakeOwnership",
+        Ask::Status => "Status",
     }
 }
 
@@ -674,35 +789,40 @@ fn propose(world: &mut World, r: Request) {
 /// again, as an update (the value the app uses for the same).
 const OLD_ROOM: [u8; 32] = [0; 32];
 
-fn refuse_unless_admin(world: &World, r: Request) -> Option<Request> {
+/// The request, if it comes from a maintainer or an admin; otherwise refused.
+fn refuse_unless_maintainer(world: &World, r: Request) -> Option<Request> {
     let from = r.from.to_string();
-    if world.resource::<Documents>().admins.contains(&from) {
+    let role = world.resource::<Documents>().users.role(&from);
+    if role >= Some(Role::Maintainer) {
         return Some(r);
     }
     info!(
-        "refused {:?} from {}: not an admin",
+        "refused {} of {} from {}: a {}",
+        asked(&r.ask),
         r.document,
-        r.from.fmt_short()
+        r.from.fmt_short(),
+        role.unwrap_or(Role::Collaborator)
     );
     r.verdict(Verdict::Refused(
-        "This host takes documents only from its admins".into(),
+        "This host takes documents only from its maintainers and admins".into(),
     ));
     None
 }
 
-/// A document shared with the host: an admin's, about to be given to it (Transfer ownership
-/// needs the host among its members). Taken, but not kept: the host keeps only what it owns.
+/// A document shared with the host: a maintainer's, about to be given to it (Transfer
+/// ownership needs the host among its members). Taken, but not kept: the host keeps only what
+/// it owns.
 fn invited(world: &mut World, r: Request) {
-    if let Some(r) = refuse_unless_admin(world, r) {
+    if let Some(r) = refuse_unless_maintainer(world, r) {
         r.verdict(Verdict::Accepted(0));
     }
 }
 
-/// **Transfer ownership** from an admin: the document, who it is shared with and its comments
-/// are the host's now. The old owner stays a member, with Can edit, and everyone it is shared
-/// with is sent the new link.
+/// **Transfer ownership** from a maintainer or an admin: the document, who it is shared with
+/// and its comments are the host's now, and they maintain it. The old owner stays a member,
+/// with Can edit, and everyone it is shared with is sent the new link.
 fn take_ownership(world: &mut World, r: Request) {
-    let Some(r) = refuse_unless_admin(world, r) else {
+    let Some(r) = refuse_unless_maintainer(world, r) else {
         return;
     };
     let Ask::TakeOwnership(o) = &r.ask else {
@@ -750,7 +870,37 @@ fn take_ownership(world: &mut World, r: Request) {
         error!("cannot keep {}: {e}", doc.name);
         return r.verdict(Verdict::Refused(format!("The host cannot keep it: {e}")));
     }
-    info!("{} gave the host {}", o.from_name, doc.name);
+    let giver = docs
+        .users
+        .by_id(&r.from.to_string())
+        .map(|u| u.name.clone());
+    let users = giver
+        .as_deref()
+        .map(|giver| Users::edit(docs.store.root(), |u| u.set_maintainer(doc.id, giver, true)));
+    match users {
+        Some(Ok((users, ()))) => docs.users = users,
+        Some(Err(e)) => error!("cannot note who maintains {}: {e}", doc.name),
+        None => {}
+    }
+    let unknown: Vec<&str> = meta
+        .sharing
+        .iter()
+        .flat_map(|s| &s.members)
+        .filter(|m| docs.users.by_id(&m.id).is_none())
+        .map(|m| m.name.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        warn!(
+            "{} is shared with people who aren't users of the host, who can't open it: {}",
+            doc.name,
+            unknown.join(", ")
+        );
+    }
+    info!(
+        "{} gave the host {}",
+        giver.as_deref().unwrap_or(&o.from_name),
+        doc.name
+    );
     docs.rescan = true;
     docs.next_invites = 0.0;
     r.verdict(Verdict::Accepted(0));
@@ -1024,8 +1174,18 @@ fn own_id(world: &World) -> String {
 /// Everyone in the room hears the new access, and a new member is sent the link.
 fn membership(world: &mut World, r: Request) {
     let from = r.from.to_string();
+    let users = &world.resource::<Documents>().users;
+    // A maintainer of the document, or an admin, manages it whatever their own access.
+    let manager = users.maintains(&from, r.document).then(|| Access {
+        permission: Permission::Edit,
+        rights: Rights::of(Permission::Edit),
+    });
+    let stranger = match &r.ask {
+        Ask::AddMember { id, name, .. } if users.by_id(id).is_none() => Some(name.clone()),
+        _ => None,
+    };
     let mine = match hosted(world, &r) {
-        Ok(h) => h.meta.sharing.as_ref().and_then(|s| s.access(&from)),
+        Ok(h) => manager.or_else(|| h.meta.sharing.as_ref().and_then(|s| s.access(&from))),
         Err(why) => return r.refuse(why),
     };
     let me = own_id(world);
@@ -1050,6 +1210,13 @@ fn membership(world: &mut World, r: Request) {
             }
             if id.parse::<EndpointId>().is_err() {
                 let why = format!("{id} is not a cadrs ID");
+                return r.verdict(Verdict::Refused(why));
+            }
+            if let Some(who) = stranger {
+                let who = if who.is_empty() { id.clone() } else { who };
+                let why = format!(
+                    "{who} isn't one of the host's users, who can't open it: ask its admin to add them"
+                );
                 return r.verdict(Verdict::Refused(why));
             }
             let permission = if mine.permission.can_edit() {
@@ -1156,6 +1323,10 @@ fn deliver_invites(world: &mut World) {
         };
         for m in &sharing.members {
             if m.delivered == Some(sharing.topic) || h.invites.contains_key(&m.id) {
+                continue;
+            }
+            // Someone the host doesn't answer would only be refused.
+            if docs.users.by_id(&m.id).is_none() {
                 continue;
             }
             let Ok(to) = m.id.parse::<EndpointId>() else {
