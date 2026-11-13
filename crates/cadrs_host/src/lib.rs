@@ -31,7 +31,7 @@
 //! host and transfer it, the host sends everyone it is shared with the new link, and they
 //! maintain it from then on. The maintainers of a document and the admins may share it with
 //! more people (users only) whatever their own access. [`admin`] has the commands that list
-//! and change all of this.
+//! and change all of this, and the backup.
 //!
 //! The host stays out of the public room (public documents, the check-in at peers.cadrs.net)
 //! unless an admin turns it on (`--public on`, kept in `host.ron`): it is there for the team's

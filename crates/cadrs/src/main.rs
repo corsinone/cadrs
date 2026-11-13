@@ -104,6 +104,9 @@ Usage:
   cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...
         [--data-dir <dir>]
       Shows one of a host's documents, after making users its maintainers or no longer.
+  cadrs --host-backup <folder> [--data-dir <dir>]
+      Copies a host's data dir into a new folder, consistently even while it runs, and reads
+      the copy back.
   cadrs --install
       Installs this build for the current user, with a launcher entry (Linux, macOS, Windows;
       `cargo install-local`).

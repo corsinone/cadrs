@@ -5,7 +5,7 @@
 //! a tab one of them has open for themselves; members added, sent the link, and leaving; a
 //! document handed back after the host was away; one a maintainer gives the host; the public
 //! room, which the host stays out of unless it is turned on; a restart; the host's users, the
-//! only ones it answers, and the commands that change them.
+//! only ones it answers, and the commands that change them; and a backup.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -743,4 +743,45 @@ fn the_commands_look_after_users_and_maintainers() {
     assert!(bad(&["--host-user", "Ada", "--role", "boss"]));
     assert!(cadrs_host::admin::parse(&["--host".to_string()]).is_none());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_backup_of_a_running_host_reads_back() {
+    let mut ann = peer("Ann");
+    let dir = temp_dir();
+    let store = Store::new(&dir);
+    let doc = Document::new("Frame");
+    let (mut host, link) = host_with(&dir, &doc, vec![member(&ann, "Ann", Permission::Edit)]);
+    let welcome = fetch(&mut host, &mut ann, &link).unwrap();
+    let mut d = doc.clone();
+    d.name = "Frame v2".into();
+    let iroh = ann.world().resource::<Iroh>();
+    let task =
+        transfer::start_propose(iroh, &link, welcome.epoch, 1, 0, &Change::between(&doc, &d));
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(1))
+    );
+    let start = Instant::now();
+    while store.load(doc.id).unwrap().document.name != "Frame v2" {
+        host.update();
+        assert!(start.elapsed() < PATIENCE, "the host never saved the edit");
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    // Copied with the host running: the document, its history and the users.
+    let copy = temp_dir().join("copy");
+    assert_eq!(cadrs_host::admin::backup(&dir, &copy), Ok(1));
+    let copied = Store::new(&copy);
+    assert_eq!(copied.load(doc.id).unwrap().document.name, "Frame v2");
+    let mut log = HistoryLog::load(&copied, doc.id).unwrap().unwrap();
+    assert_eq!(log.head().name, "Frame v2");
+    assert!(Users::read(&copy).unwrap().by_id(&id_of(&ann)).is_some());
+
+    // Never over another copy, nor inside the data dir.
+    assert!(cadrs_host::admin::backup(&dir, &copy).is_err());
+    assert!(cadrs_host::admin::backup(&dir, &dir.join("backup")).is_err());
+    assert!(!dir.join("backup").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(copy.parent().unwrap());
 }

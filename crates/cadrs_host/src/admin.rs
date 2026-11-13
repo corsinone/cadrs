@@ -8,11 +8,14 @@
 //! - `cadrs --host-documents`: the documents, with their maintainers and who can open them.
 //! - `cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...`:
 //!   one document, and who maintains it.
+//! - `cadrs --host-backup <folder>`: a consistent copy of the data dir ([`backup`]).
 //!
 //! Each takes `--data-dir <dir>`, as `cadrs --host` does.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentEntry;
 use cadrs_core::{DocumentId, Store};
 
@@ -38,6 +41,9 @@ enum Command {
     Document {
         which: String,
         maintainers: Vec<(String, bool)>,
+    },
+    Backup {
+        to: PathBuf,
     },
 }
 
@@ -78,6 +84,9 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
             "--host-document" => Some(Command::Document {
                 which: value(a, &mut it)?,
                 maintainers: Vec::new(),
+            }),
+            "--host-backup" => Some(Command::Backup {
+                to: PathBuf::from(value(a, &mut it)?),
             }),
             _ => None,
         };
@@ -251,6 +260,13 @@ pub fn run(admin: Admin) -> u8 {
             print_document(&users, &e);
             Ok(())
         }),
+        Command::Backup { to } => backup(dir, &to).map(|n| {
+            println!(
+                "Copied {n} documents, and the host's identity, settings and users, to {}.\n\
+                 The copy holds the host's key (identity.key): keep it as private as the host.",
+                to.display()
+            );
+        }),
     };
     match done {
         Ok(()) => 0,
@@ -356,4 +372,132 @@ fn print_document(users: &Users, e: &DocumentEntry) {
     if let Some(p) = sharing.link {
         println!("    anyone with the link who is a user: {}", p.label());
     }
+}
+
+/// How many times a document's folder is copied again when the host keeps changing it.
+const TRIES: usize = 10;
+
+/// Copies the data dir of a host, `dir`, into `to` (a new folder, or an empty one), running or
+/// not: each file as it was last written whole (the host writes a file next to it, then puts
+/// it in its place, so the half-written ones are left out), and each document's folder copied
+/// again if the host changed it meanwhile, so its files go together. Then every document in the
+/// copy is read back. Returns how many there are. An external tool keeps the copies (one
+/// folder each); one restores by stopping the host and putting a copy in place of its data
+/// dir, and can test one first with `cadrs --document <name> --check --data-dir <copy>`.
+pub fn backup(dir: &Path, to: &Path) -> Result<usize, String> {
+    let fail = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    if !cadrs_fs::is_dir(dir) {
+        return Err(format!("{} is not a host's data dir", dir.display()));
+    }
+    if cadrs_fs::exists(to)
+        && cadrs_fs::read_dir(to)
+            .map_err(|e| fail(to, e))?
+            .next()
+            .is_some()
+    {
+        return Err(format!("{} is not empty", to.display()));
+    }
+    cadrs_fs::create_dir_all(to).map_err(|e| fail(to, e))?;
+    let (from_c, to_c) = (
+        cadrs_fs::canonicalize(dir).map_err(|e| fail(dir, e))?,
+        cadrs_fs::canonicalize(to).map_err(|e| fail(to, e))?,
+    );
+    if to_c.starts_with(&from_c) {
+        let _ = cadrs_fs::remove_dir(to);
+        return Err(format!("{} is inside the data dir", to.display()));
+    }
+    let mut entries: Vec<PathBuf> = cadrs_fs::read_dir(dir)
+        .map_err(|e| fail(dir, e))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| !is_temporary(p))
+        .collect();
+    entries.sort();
+    for from in entries {
+        let into = to.join(from.file_name().expect("an entry of a folder"));
+        copy_unchanged(&from, &into)?;
+    }
+    // What a restore will read.
+    let store = Store::new(to);
+    let (library, errors) = store.list();
+    if let Some((path, e)) = errors.first() {
+        return Err(format!("the copy of {} can't be read: {e}", path.display()));
+    }
+    for e in &library.entries {
+        store
+            .load(e.id)
+            .map_err(|err| format!("the copy of {} can't be read: {err}", e.name))?;
+        HistoryLog::load(&store, e.id)
+            .map_err(|err| format!("the copy of {}'s history can't be read: {err}", e.name))?;
+    }
+    Users::read(to)?.check()?;
+    crate::read_settings(to)?;
+    Ok(library.entries.len())
+}
+
+/// A file the host is writing, about to replace the one it is named after.
+fn is_temporary(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "tmp")
+}
+
+/// Copies `from` (a file or a folder) to `to`, again until nothing in it changed meanwhile.
+fn copy_unchanged(from: &Path, to: &Path) -> Result<(), String> {
+    for _ in 0..TRIES {
+        let before = stamps(from)?;
+        copy(from, to)?;
+        if stamps(from)? == before {
+            return Ok(());
+        }
+        let _ = if cadrs_fs::is_dir(to) {
+            cadrs_fs::remove_dir_all(to)
+        } else {
+            cadrs_fs::remove_file(to)
+        };
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(format!(
+        "{} kept changing while it was copied",
+        from.display()
+    ))
+}
+
+/// Each file under `path` (or `path` itself) with its size and when it was written.
+fn stamps(path: &Path) -> Result<Vec<(PathBuf, u64, Option<cadrs_fs::SystemTime>)>, String> {
+    let mut out = Vec::new();
+    let mut todo = vec![path.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        if is_temporary(&p) {
+            continue;
+        }
+        let Ok(m) = cadrs_fs::metadata(&p) else {
+            // Gone meanwhile: the copy will say so.
+            continue;
+        };
+        if m.is_dir() {
+            let read = cadrs_fs::read_dir(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            todo.extend(read.filter_map(|e| e.ok().map(|e| e.path())));
+        } else {
+            out.push((p, m.len(), m.modified().ok()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn copy(from: &Path, to: &Path) -> Result<(), String> {
+    let fail = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    if !cadrs_fs::is_dir(from) {
+        return match cadrs_fs::copy(from, to) {
+            // Gone meanwhile (replaced by the host): the folder is copied again.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            done => done.map(|_| ()).map_err(|e| fail(from, e)),
+        };
+    }
+    cadrs_fs::create_dir_all(to).map_err(|e| fail(to, e))?;
+    for e in cadrs_fs::read_dir(from).map_err(|e| fail(from, e))? {
+        let p = e.map_err(|e| fail(from, e))?.path();
+        if !is_temporary(&p) {
+            copy(&p, &to.join(p.file_name().expect("an entry of a folder")))?;
+        }
+    }
+    Ok(())
 }

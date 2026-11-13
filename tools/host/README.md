@@ -37,4 +37,16 @@ docker exec cadrs-host cadrs --host-document "Bracket" --maintainer "Ada" --data
 `cadrs --help` lists them all (`--rename`, `--remove`, `--forget-id`...).
 
 `docker stop cadrs-host` sends Ctrl+C (the image's `STOPSIGNAL`): the host saves every edit and
-history log before it stops. To back it up, copy `/data` while it is stopped.
+history log before it stops.
+
+To back it up while it runs, copy its data into a new folder, which the command reads back
+(an external tool, restic or borg, then keeps the copies):
+
+```sh
+docker exec cadrs-host cadrs --host-backup /data-backups/$(date +%F) --data-dir /data
+```
+
+with a second volume for the copies (`-v /srv/cadrs-host/backups:/data-backups` on `docker run`).
+A copy holds the host's key (`identity.key`): keep it as private as the host. To restore one,
+stop the host and put the copy in place of `/data`; `cadrs --document <name> --check --data-dir
+<copy>` tries a document of it first.
