@@ -2,7 +2,7 @@
 //! document in its data dir, an editor fetches it and edits it, a viewer and a stranger are
 //! kept to what they may do, the editor makes a version and the viewer comments, and all of it
 //! is on disk afterwards: the document, its history log and its comments. Then two editors and
-//! a tab one of them has open for themselves.
+//! a tab one of them has open for themselves; and members added, sent the link, and leaving.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 use bevy::prelude::*;
 use cadrs_core::collab::comments::{Comment, CommentOp, Comments};
 use cadrs_core::collab::sync::Change;
-use cadrs_core::collab::{Member, Permission, Sharing};
+use cadrs_core::collab::{Access, Member, Permission, Rights, Sharing};
 use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, Store};
 use cadrs_net::bevy_iroh::{Iroh, IrohTask, Relays};
-use cadrs_net::{NetPlugin, ShareLink, Verdict, Welcome, transfer};
+use cadrs_net::{Ask, NetPlugin, Requests, ShareLink, Verdict, Welcome, transfer};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 const TOPIC: [u8; 32] = [7; 32];
@@ -305,5 +305,90 @@ fn the_host_keeps_the_tabs_someone_has_open_for_themselves() {
         wait(&mut [&mut host, &mut ann], task),
         Ok(Verdict::Accepted(2))
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn whoever_may_share_adds_people_who_get_the_link_and_may_leave() {
+    let mut ann = peer("Ann");
+    let mut vic = peer("Vic");
+    let mut ned = peer("Ned");
+    let dir = temp_dir();
+    let store = Store::new(&dir);
+    let doc = Document::new("Frame");
+    let members = vec![
+        member(&ann, "Ann", Permission::Edit),
+        member(&vic, "Vic", Permission::View),
+    ];
+    let (mut host, link) = host_with(&dir, &doc, members);
+    let edit = Access {
+        permission: Permission::Edit,
+        rights: Rights::of(Permission::Edit),
+    };
+
+    // Ned tries the link first, and is refused. (The test has no relays or address lookup, so
+    // this is also how the host learns where Ned is, to send the link later.)
+    assert!(fetch(&mut host, &mut ned, &link).is_err());
+
+    // Vic, who may only view, may not share; Ann may.
+    let iroh = vic.world().resource::<Iroh>();
+    let task = transfer::start_add_member(iroh, &link, id_of(&ned), "Ned".into(), edit);
+    assert!(matches!(
+        wait(&mut [&mut host, &mut vic], task),
+        Ok(Verdict::Refused(_))
+    ));
+    let iroh = ann.world().resource::<Iroh>();
+    let task = transfer::start_add_member(iroh, &link, id_of(&ned), "Ned".into(), edit);
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(0))
+    );
+
+    // The host sends Ned the link, which Ned's cadrs takes.
+    let start = Instant::now();
+    let invite = loop {
+        host.update();
+        ned.update();
+        let asks = ned.world_mut().resource_mut::<Requests>().drain();
+        if let Some(r) = asks.into_iter().find(|r| matches!(r.ask, Ask::Invite(_))) {
+            let Ask::Invite(invite) = &r.ask else {
+                unreachable!()
+            };
+            let invite = invite.clone();
+            r.verdict(Verdict::Accepted(0));
+            break invite;
+        }
+        assert!(start.elapsed() < PATIENCE, "the host never sent the link");
+        std::thread::sleep(Duration::from_millis(16));
+    };
+    assert_eq!(invite.access.permission, Permission::Edit);
+    assert_eq!(invite.owner_name, "Team host");
+    let sent: ShareLink = invite.link.parse().unwrap();
+    assert_eq!((sent.document, sent.topic), (doc.id, TOPIC));
+    assert_eq!(sent.owner.id, link.owner.id);
+
+    // Ned can open the document, and the host notes that Ned has the link.
+    let welcome = fetch(&mut host, &mut ned, &link).unwrap();
+    assert_eq!(welcome.access.permission, Permission::Edit);
+    let start = Instant::now();
+    loop {
+        host.update();
+        let meta = store.load(doc.id).unwrap().meta;
+        let sharing = meta.sharing.unwrap();
+        let noted = sharing.members.iter().find(|m| m.id == id_of(&ned));
+        if noted.is_some_and(|m| m.delivered == Some(TOPIC)) {
+            break;
+        }
+        assert!(start.elapsed() < PATIENCE, "the host never noted the link");
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    // Ned leaves, and can no longer open it.
+    let task = transfer::start_leave(ned.world().resource::<Iroh>(), &link);
+    assert_eq!(
+        wait(&mut [&mut host, &mut ned], task),
+        Ok(Verdict::Accepted(0))
+    );
+    assert!(fetch(&mut host, &mut ned, &link).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }

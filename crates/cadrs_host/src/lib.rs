@@ -17,9 +17,11 @@
 //! owner's app records it; versions are made there (**Create version** by whoever may edit),
 //! and comments are kept next to the document. It keeps the tab locks too ("Open tab, close
 //! it for other users"): it grants them, refuses the others' edits to a held tab, and lets a
-//! lock go when its holder has left the tab. It answers Join, Propose, Status, Comment,
-//! CreateVersion, Lock and Unlock; sharing requests, handover and transfers are refused for
-//! now.
+//! lock go when its holder has left the tab. Whoever may share asks it to add people, and
+//! members leave; everyone in the room hears the new access, and each member is sent the link
+//! until their cadrs takes it (as the owner's app does while the document is open). It
+//! answers Join, Propose, Status, Comment, CreateVersion, Lock, Unlock, AddMember and Leave;
+//! handover and transfers are refused for now.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +31,7 @@ use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use cadrs_core::collab::comments::{CommentOp, Comments};
 use cadrs_core::collab::sync::{Key, Refusal, Sequencer};
-use cadrs_core::collab::{Permission, Snapshot};
+use cadrs_core::collab::{Member, Permission, Snapshot};
 use cadrs_core::history_log::{HistoryLog, Origin, VersionId, document_hash};
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, DocumentId, ElementId, Store};
@@ -37,8 +39,8 @@ use cadrs_net::bevy_iroh::iroh::EndpointId;
 use cadrs_net::bevy_iroh::prelude::{NetSender, Peer, PeerJoined, Received};
 use cadrs_net::bevy_iroh::{Iroh, Relays};
 use cadrs_net::{
-    Ask, CommentChanged, LocksChanged, Presence, Request, Requests, Sequenced, Verdict,
-    VersionCreated, Welcome, session,
+    AccessChanged, Answer, Ask, CommentChanged, Invite, LocksChanged, Presence, Request, Requests,
+    Sequenced, ShareLink, Verdict, VersionCreated, Welcome, session, transfer,
 };
 
 /// How often the data dir is read again for documents that came, went or changed rooms.
@@ -52,6 +54,9 @@ const REPORT_EVERY: f64 = 300.0;
 const AWAY: f64 = 3.0;
 /// Someone not heard from this long has left (their presence comes every few seconds).
 const FORGET_AFTER: f64 = 15.0;
+/// How often the link goes out again to members whose cadrs hasn't taken it (the app's
+/// owner tries as often).
+const RETRY_INVITES: f64 = 30.0;
 
 pub struct Host {
     dir: PathBuf,
@@ -114,6 +119,8 @@ struct Hosted {
     away: Vec<(ElementId, f64)>,
     /// The tab each peer in the room is in, by cadrs ID, and when they were last heard from.
     present: HashMap<String, (Option<ElementId>, f64)>,
+    /// The links on their way to members, by cadrs ID: the room each names, and the answer.
+    invites: HashMap<String, ([u8; 32], Answer<Verdict>)>,
 }
 
 impl Hosted {
@@ -127,6 +134,19 @@ impl Hosted {
             .iter()
             .find(|(e, id, _)| *e == element && id != by)
             .map(|(.., name)| name.as_str())
+    }
+
+    fn access_changed(&self, document: DocumentId) -> Option<Outgoing> {
+        let s = self.meta.sharing.as_ref()?;
+        Some(Outgoing::Access(AccessChanged {
+            document,
+            members: s
+                .members
+                .iter()
+                .map(|m| (m.id.clone(), m.access()))
+                .collect(),
+            link: s.link_access(),
+        }))
     }
 
     fn locks_changed(&self, document: DocumentId) -> Outgoing {
@@ -144,6 +164,8 @@ struct Documents {
     /// What collaborators see as the owner's name.
     name: String,
     open: HashMap<DocumentId, Hosted>,
+    /// When to send the links again (seconds on the real clock): 0 sends them at once.
+    next_invites: f64,
 }
 
 /// What the host tells a room.
@@ -152,6 +174,7 @@ enum Outgoing {
     Version(VersionCreated),
     Comment(CommentChanged),
     Locks(LocksChanged),
+    Access(AccessChanged),
 }
 
 /// Messages on their way to their rooms.
@@ -207,11 +230,22 @@ pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, rel
         store: Store::new(dir),
         name: name.into(),
         open: HashMap::new(),
+        next_invites: 0.0,
     })
     .init_resource::<Outbox>()
     .add_systems(
         Update,
-        (scan, hear, serve, release_left, send, save, report).chain(),
+        (
+            scan,
+            hear,
+            serve,
+            release_left,
+            deliver_invites,
+            send,
+            save,
+            report,
+        )
+            .chain(),
     );
 }
 
@@ -318,6 +352,7 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
                 locks: Vec::new(),
                 away: Vec::new(),
                 present: HashMap::new(),
+                invites: HashMap::new(),
             },
         );
     }
@@ -367,6 +402,7 @@ fn serve(world: &mut World) {
             Ask::Comment(_) => comment(world, r),
             Ask::CreateVersion { .. } => version(world, r),
             Ask::Lock { .. } | Ask::Unlock { .. } => lock(world, r),
+            Ask::AddMember { .. } | Ask::Leave => membership(world, r),
             Ask::Status => {
                 let open = hosted(world, &r).is_ok();
                 r.verdict(Verdict::Accepted(open as u64))
@@ -702,6 +738,171 @@ fn lock(world: &mut World, r: Request) {
     r.verdict(Verdict::Accepted(0));
 }
 
+/// The host's own cadrs ID.
+fn own_id(world: &World) -> String {
+    cadrs_net::cadrs_id(world.get_resource::<Iroh>()).unwrap_or_default()
+}
+
+/// Someone who may share (the **Share** checkbox) asks the host to share the document with
+/// someone else, giving no more than they have; or a member leaves it (**Unshare with me**).
+/// Everyone in the room hears the new access, and a new member is sent the link.
+fn membership(world: &mut World, r: Request) {
+    let from = r.from.to_string();
+    let mine = match hosted(world, &r) {
+        Ok(h) => h.meta.sharing.as_ref().and_then(|s| s.access(&from)),
+        Err(why) => return r.refuse(why),
+    };
+    let me = own_id(world);
+    let asker = peer_name(world, r.from);
+    let mut docs = world.resource_mut::<Documents>();
+    let docs = &mut *docs;
+    let Some(h) = docs.open.get_mut(&r.document) else {
+        return r.verdict(Verdict::Closed);
+    };
+    let Some(sharing) = h.meta.sharing.as_mut() else {
+        return r.verdict(Verdict::Closed);
+    };
+    let what = match &r.ask {
+        Ask::AddMember { id, name, access } => {
+            let Some(mine) = mine.filter(|a| a.rights.share) else {
+                return r.verdict(Verdict::Refused(
+                    "You may not share this document: ask its owner".into(),
+                ));
+            };
+            if *id == me {
+                return r.verdict(Verdict::Refused("That is the host's own cadrs ID".into()));
+            }
+            if id.parse::<EndpointId>().is_err() {
+                let why = format!("{id} is not a cadrs ID");
+                return r.verdict(Verdict::Refused(why));
+            }
+            let permission = if mine.permission.can_edit() {
+                access.permission
+            } else {
+                Permission::View
+            };
+            match sharing.members.iter_mut().find(|m| m.id == *id) {
+                Some(m) => {
+                    m.permission = permission;
+                    m.rights = Some(access.rights);
+                    if !name.is_empty() {
+                        m.name = name.clone();
+                    }
+                }
+                None => sharing.members.push(Member {
+                    id: id.clone(),
+                    name: name.clone(),
+                    permission,
+                    rights: Some(access.rights),
+                    delivered: None,
+                }),
+            }
+            docs.next_invites = 0.0;
+            format!("{asker} shared {} with {name}", h.name)
+        }
+        Ask::Leave => {
+            sharing.members.retain(|m| m.id != from);
+            h.invites.remove(&from);
+            format!("{asker} left {}", h.name)
+        }
+        _ => return,
+    };
+    if let Err(e) = docs.store.save(&h.confirmed, &h.meta) {
+        error!("cannot save {}: {e}", h.name);
+        return r.verdict(Verdict::Refused(format!("The host could not save it: {e}")));
+    }
+    info!("{what}");
+    let m = h.access_changed(r.document);
+    let room = h.room;
+    world
+        .resource_mut::<Outbox>()
+        .0
+        .extend(m.map(|m| (room, m)));
+    r.verdict(Verdict::Accepted(0));
+}
+
+/// Sends each document's link to every member whose cadrs doesn't have the current one, and
+/// notes who took it.
+fn deliver_invites(world: &mut World) {
+    let t = now(world);
+    // The answers.
+    let mut docs = world.resource_mut::<Documents>();
+    let docs = &mut *docs;
+    for h in docs.open.values_mut() {
+        let mut taken = Vec::new();
+        h.invites
+            .retain(|member, (topic, task)| match task.try_take() {
+                Some(Ok(Verdict::Accepted(_))) => {
+                    taken.push((member.clone(), *topic));
+                    false
+                }
+                Some(Ok(other)) => {
+                    info!("{member} did not take the link to {}: {other:?}", h.name);
+                    false
+                }
+                Some(Err(why)) => {
+                    debug!("cannot reach {member} yet: {why}");
+                    false
+                }
+                None => true,
+            });
+        let Some(sharing) = h.meta.sharing.as_mut().filter(|_| !taken.is_empty()) else {
+            continue;
+        };
+        for (member, topic) in taken {
+            if let Some(m) = sharing.members.iter_mut().find(|m| m.id == member) {
+                m.delivered = Some(topic);
+            }
+        }
+        if let Err(e) = docs.store.save(&h.confirmed, &h.meta) {
+            warn!("cannot note the links sent for {}: {e}", h.name);
+        }
+    }
+    if t < docs.next_invites {
+        return;
+    }
+    docs.next_invites = t + RETRY_INVITES;
+    // The links still to send.
+    let Some(owner) = world.get_resource::<Iroh>().and_then(Iroh::addr) else {
+        return;
+    };
+    let docs = world.resource::<Documents>();
+    let mut sends = Vec::new();
+    for (id, h) in &docs.open {
+        let Some(sharing) = &h.meta.sharing else {
+            continue;
+        };
+        let link = ShareLink {
+            document: *id,
+            name: h.confirmed.name.clone(),
+            topic: sharing.topic,
+            owner: owner.clone(),
+        };
+        for m in &sharing.members {
+            if m.delivered == Some(sharing.topic) || h.invites.contains_key(&m.id) {
+                continue;
+            }
+            let Ok(to) = m.id.parse::<EndpointId>() else {
+                continue;
+            };
+            let invite = Invite {
+                link: link.to_string(),
+                owner_name: docs.name.clone(),
+                access: m.access(),
+                message: String::new(),
+                update: m.delivered.is_some(),
+            };
+            sends.push((*id, m.id.clone(), to, link.clone(), invite));
+        }
+    }
+    for (id, member, to, link, invite) in sends {
+        let task = transfer::start_invite(world.resource::<Iroh>(), to, &link, invite);
+        if let Some(h) = world.resource_mut::<Documents>().open.get_mut(&id) {
+            h.invites.insert(member, (link.topic, task));
+        }
+    }
+}
+
 /// Lets a lock go when its holder has been away from its tab (or the document) for a while.
 fn release_left(
     time: Res<Time<bevy::time::Real>>,
@@ -761,6 +962,9 @@ fn send(mut outbox: ResMut<Outbox>, net: NetSender) {
                 net.broadcast(room, &m);
             }
             Outgoing::Locks(m) => {
+                net.broadcast(room, &m);
+            }
+            Outgoing::Access(m) => {
                 net.broadcast(room, &m);
             }
         }
