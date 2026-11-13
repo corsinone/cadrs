@@ -361,9 +361,11 @@ pub fn run(host: Host) -> AppExit {
             1.0 / 30.0,
         ))),
         bevy::log::LogPlugin::default(),
-        // Ctrl+C stops the host after a last save, rather than at once.
-        bevy::app::TerminalCtrlCHandlerPlugin,
     ));
+    // Ctrl+C stops the host after a last save, rather than at once. (A page has no terminal;
+    // the browser build compiles this crate, though it never runs a host.)
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_plugins(bevy::app::TerminalCtrlCHandlerPlugin);
     let identity = Some(host.dir.join(cadrs_net::IDENTITY_FILE));
     add(&mut app, &host.dir, &host.name, identity, Relays::default());
     match cadrs_net::cadrs_id(app.world().get_resource::<Iroh>()) {
