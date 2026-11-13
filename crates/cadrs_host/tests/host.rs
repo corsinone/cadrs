@@ -4,7 +4,7 @@
 //! is on disk afterwards: the document, its history log and its comments. Then two editors and
 //! a tab one of them has open for themselves; members added, sent the link, and leaving; a
 //! document handed back after the host was away; one an admin gives the host; and the public
-//! room, which the host stays out of unless it is turned on.
+//! room, which the host stays out of unless it is turned on; and a restart.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -512,5 +512,46 @@ fn the_host_stays_out_of_the_public_room_unless_turned_on() {
     assert!(in_public_room(&dir));
     cadrs_host::set_public(&dir, false).unwrap();
     assert!(!in_public_room(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_host_stopped_and_started_again_has_everything() {
+    let mut ann = peer("Ann");
+    let dir = temp_dir();
+    let doc = Document::new("Frame");
+    let members = vec![member(&ann, "Ann", Permission::Edit)];
+    let (mut host, link) = host_with(&dir, &doc, members);
+    let welcome = fetch(&mut host, &mut ann, &link).unwrap();
+
+    // An edit, then the host is stopped at once: it still saves the edit on the way out.
+    let mut d = doc.clone();
+    d.name = "Frame v2".into();
+    let iroh = ann.world().resource::<Iroh>();
+    let task =
+        transfer::start_propose(iroh, &link, welcome.epoch, 1, 0, &Change::between(&doc, &d));
+    assert_eq!(
+        wait(&mut [&mut host, &mut ann], task),
+        Ok(Verdict::Accepted(1))
+    );
+    host.world_mut().write_message(AppExit::Success);
+    host.update();
+    drop(host);
+
+    // Started again on the same data dir, it has the document, its history and its sharing.
+    let mut host = App::new();
+    host.add_plugins(MinimalPlugins);
+    cadrs_host::add(&mut host, &dir, "Team host", None, Relays::Disabled);
+    let link = ShareLink {
+        owner: host.world().resource::<Iroh>().addr().unwrap(),
+        ..link
+    };
+    let again = fetch(&mut host, &mut ann, &link).unwrap();
+    assert_eq!(again.snapshot.document.name, "Frame v2");
+    assert_ne!(again.epoch, welcome.epoch);
+    let mut log = HistoryLog::load(&Store::new(&dir), doc.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(log.head().name, "Frame v2");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -326,6 +326,8 @@ pub fn run(host: Host) -> AppExit {
             1.0 / 30.0,
         ))),
         bevy::log::LogPlugin::default(),
+        // Ctrl+C stops the host after a last save, rather than at once.
+        bevy::app::TerminalCtrlCHandlerPlugin,
     ));
     let identity = Some(host.dir.join(cadrs_net::IDENTITY_FILE));
     add(&mut app, &host.dir, &host.name, identity, Relays::default());
@@ -397,7 +399,8 @@ pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, rel
             report,
         )
             .chain(),
-    );
+    )
+    .add_systems(Last, save_on_exit);
 }
 
 fn now(world: &World) -> f64 {
@@ -1245,6 +1248,30 @@ fn send(mut outbox: ResMut<Outbox>, net: NetSender) {
 }
 
 /// Saves the documents whose edits have waited long enough.
+/// On the way out (Ctrl+C, which `docker stop` sends with the image's `STOPSIGNAL`), saves
+/// every edit not saved yet and the history logs, so a restart loses nothing.
+fn save_on_exit(exit: MessageReader<AppExit>, mut docs: ResMut<Documents>) {
+    if exit.is_empty() {
+        return;
+    }
+    let docs = &mut *docs;
+    for h in docs.open.values_mut() {
+        if h.unsaved.take().is_none() {
+            continue;
+        }
+        h.meta.modified = unix_now();
+        if let Err(e) = docs.store.save(&h.confirmed, &h.meta) {
+            error!("cannot save {}: {e}", h.name);
+        }
+        if let Err(e) = h.log.save(&docs.store) {
+            error!("cannot save the history of {}: {e}", h.name);
+        }
+    }
+    // (And the history saves still on their way.)
+    cadrs_core::history_log::flush_saves();
+    info!("saved everything: stopping");
+}
+
 fn save(world: &mut World) {
     let t = now(world);
     let mut docs = world.resource_mut::<Documents>();
