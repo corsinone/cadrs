@@ -22,7 +22,12 @@
 //! until their cadrs takes it (as the owner's app does while the document is open). It
 //! answers Join, Propose, Status, Comment, CreateVersion, Lock, Unlock, AddMember and Leave,
 //! and takes documents back by Handover from whoever kept the edits in order while the host
-//! was away; transfers are refused for now.
+//! was away.
+//!
+//! Documents come to the host by **Transfer ownership** from one of its admins (the cadrs IDs
+//! in `host.ron` in its data dir, added with `--admin`): they share the document with the host
+//! and transfer it, and the host sends everyone it is shared with the new link. Anyone else's
+//! transfers, and links shared with the host by anyone but an admin, are refused.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -62,6 +67,43 @@ const RETRY_INVITES: f64 = 30.0;
 pub struct Host {
     dir: PathBuf,
     name: String,
+    /// cadrs IDs to add to the admins.
+    admins: Vec<String>,
+}
+
+/// The host's settings, in its data dir.
+pub const SETTINGS_FILE: &str = "host.ron";
+
+/// What `host.ron` holds.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Settings {
+    /// Who may give the host documents (Transfer ownership): their cadrs IDs.
+    #[serde(default)]
+    admins: Vec<String>,
+}
+
+fn read_settings(dir: &Path) -> Result<Settings, String> {
+    let path = dir.join(SETTINGS_FILE);
+    if !cadrs_fs::exists(&path) {
+        return Ok(Settings::default());
+    }
+    let text = cadrs_fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    ron::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Makes `id` (a cadrs ID) one of the admins of the host whose data dir is `dir`.
+pub fn add_admin(dir: &Path, id: &str) -> Result<(), String> {
+    id.parse::<EndpointId>()
+        .map_err(|_| format!("{id} is not a cadrs ID"))?;
+    let mut settings = read_settings(dir)?;
+    if settings.admins.iter().any(|a| a == id) {
+        return Ok(());
+    }
+    settings.admins.push(id.to_string());
+    let text = ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default())
+        .map_err(|e| e.to_string())?;
+    let path = dir.join(SETTINGS_FILE);
+    cadrs_fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// `Some` when the arguments ask for a host.
@@ -71,6 +113,7 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
     }
     let mut dir = std::env::var_os("CADRS_DATA_DIR").map(PathBuf::from);
     let mut name = "cadrs host".to_string();
+    let mut admins = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -83,9 +126,13 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
                 Some(n) if !n.trim().is_empty() => name = n.trim().to_string(),
                 _ => return Some(Err("--name needs a name".into())),
             },
+            "--admin" => match it.next() {
+                Some(id) => admins.push(id.trim().to_string()),
+                None => return Some(Err("--admin needs a cadrs ID".into())),
+            },
             other => {
                 return Some(Err(format!(
-                    "{other}: a host takes only --data-dir and --name"
+                    "{other}: a host takes only --data-dir, --name and --admin"
                 )));
             }
         }
@@ -94,7 +141,7 @@ pub fn parse(args: &[String]) -> Option<Result<Host, String>> {
         Store::default_root().map(|r| r.parent().map_or(r.clone(), |p| p.join("host")))
     });
     Some(match dir {
-        Some(dir) => Ok(Host { dir, name }),
+        Some(dir) => Ok(Host { dir, name, admins }),
         None => Err("No data dir: give one with --data-dir".into()),
     })
 }
@@ -198,6 +245,10 @@ struct Documents {
     open: HashMap<DocumentId, Hosted>,
     /// When to send the links again (seconds on the real clock): 0 sends them at once.
     next_invites: f64,
+    /// Who may give the host documents (`host.ron`).
+    admins: Vec<String>,
+    /// Look at the data dir now, not at the next scan (a document just came).
+    rescan: bool,
 }
 
 /// What the host tells a room.
@@ -214,10 +265,23 @@ enum Outgoing {
 struct Outbox(Vec<(Entity, Outgoing)>);
 
 pub fn run(host: Host) -> AppExit {
-    if let Err(e) = std::fs::create_dir_all(&host.dir) {
+    if let Err(e) = cadrs_fs::create_dir_all(&host.dir) {
         eprintln!("cannot use {}: {e}", host.dir.display());
         return AppExit::from_code(2);
     }
+    for id in &host.admins {
+        if let Err(e) = add_admin(&host.dir, id) {
+            eprintln!("{e}");
+            return AppExit::from_code(2);
+        }
+    }
+    let admins = match read_settings(&host.dir) {
+        Ok(s) => s.admins,
+        Err(e) => {
+            eprintln!("{e}");
+            return AppExit::from_code(2);
+        }
+    };
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
@@ -235,6 +299,11 @@ pub fn run(host: Host) -> AppExit {
                 host.dir.display()
             );
             println!("cadrs ID: {id}");
+            if admins.is_empty() {
+                println!("No admins yet: add one with --admin <cadrs ID> to give it documents.");
+            } else {
+                println!("Admins: {}", admins.join(", "));
+            }
         }
         None => {
             eprintln!(
@@ -258,11 +327,17 @@ pub fn add(app: &mut App, dir: &Path, name: &str, identity: Option<PathBuf>, rel
         relays,
         autostart: true,
     });
+    let admins = read_settings(dir).map(|s| s.admins).unwrap_or_else(|e| {
+        error!("{e}");
+        Vec::new()
+    });
     app.insert_resource(Documents {
         store: Store::new(dir),
         name: name.into(),
         open: HashMap::new(),
         next_invites: 0.0,
+        admins,
+        rescan: false,
     })
     .init_resource::<Outbox>()
     .add_systems(
@@ -326,7 +401,8 @@ fn open_log(store: &Store, doc: &Document, meta: &DocumentMeta, host: &str) -> H
 /// longer shared, was trashed, or moved to a new room (link sharing turned off).
 fn scan(world: &mut World, mut last: Local<Option<f64>>) {
     let t = now(world);
-    if last.is_some_and(|l| t - l < SCAN_EVERY) {
+    let rescan = std::mem::take(&mut world.resource_mut::<Documents>().rescan);
+    if !rescan && last.is_some_and(|l| t - l < SCAN_EVERY) {
         return;
     }
     *last = Some(t);
@@ -436,11 +512,12 @@ fn serve(world: &mut World) {
             Ask::Lock { .. } | Ask::Unlock { .. } => lock(world, r),
             Ask::AddMember { .. } | Ask::Leave => membership(world, r),
             Ask::Handover(_) => handover(world, r),
+            Ask::Invite(_) => invited(world, r),
+            Ask::TakeOwnership(_) => take_ownership(world, r),
             Ask::Status => {
                 let open = hosted(world, &r).is_ok();
                 r.verdict(Verdict::Accepted(open as u64))
             }
-            _ => r.refuse("This host does not do that yet"),
         }
     }
 }
@@ -544,6 +621,92 @@ fn propose(world: &mut World, r: Request) {
         Err(Refusal::Stale) => Verdict::Resync,
     };
     r.verdict(verdict);
+}
+
+/// A room that once had a member's link but no longer does: the host sends everyone the link
+/// again, as an update (the value the app uses for the same).
+const OLD_ROOM: [u8; 32] = [0; 32];
+
+fn refuse_unless_admin(world: &World, r: Request) -> Option<Request> {
+    let from = r.from.to_string();
+    if world.resource::<Documents>().admins.contains(&from) {
+        return Some(r);
+    }
+    info!(
+        "refused {:?} from {}: not an admin",
+        r.document,
+        r.from.fmt_short()
+    );
+    r.verdict(Verdict::Refused(
+        "This host takes documents only from its admins".into(),
+    ));
+    None
+}
+
+/// A document shared with the host: an admin's, about to be given to it (Transfer ownership
+/// needs the host among its members). Taken, but not kept: the host keeps only what it owns.
+fn invited(world: &mut World, r: Request) {
+    if let Some(r) = refuse_unless_admin(world, r) {
+        r.verdict(Verdict::Accepted(0));
+    }
+}
+
+/// **Transfer ownership** from an admin: the document, who it is shared with and its comments
+/// are the host's now. The old owner stays a member, with Can edit, and everyone it is shared
+/// with is sent the new link.
+fn take_ownership(world: &mut World, r: Request) {
+    let Some(r) = refuse_unless_admin(world, r) else {
+        return;
+    };
+    let Ask::TakeOwnership(o) = &r.ask else {
+        return;
+    };
+    let o = (**o).clone();
+    if world.resource::<Documents>().open.contains_key(&r.document) {
+        return r.verdict(Verdict::Refused(
+            "The host has this document already".into(),
+        ));
+    }
+    let doc = match o.snapshot.clone().install() {
+        Ok(d) if d.id == r.document => d,
+        _ => return r.verdict(Verdict::Refused("Not this document".into())),
+    };
+    let me = own_id(world);
+    let from = r.from.to_string();
+    let mut sharing = o.sharing.clone();
+    sharing.members.retain(|m| m.id != me && m.id != from);
+    for m in &mut sharing.members {
+        if m.delivered.is_some() {
+            m.delivered = Some(OLD_ROOM);
+        }
+    }
+    sharing.members.push(Member {
+        id: from,
+        name: o.from_name.clone(),
+        permission: Permission::Edit,
+        rights: None,
+        delivered: Some(OLD_ROOM),
+    });
+    let mut docs = world.resource_mut::<Documents>();
+    let mut meta = DocumentMeta::new(&docs.name, unix_now());
+    meta.sharing = Some(sharing);
+    let kept = docs
+        .store
+        .create(&doc, &meta)
+        .map_err(|e| e.to_string())
+        .and_then(|_| {
+            o.comments
+                .save(&docs.store.doc_dir(doc.id))
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = kept {
+        error!("cannot keep {}: {e}", doc.name);
+        return r.verdict(Verdict::Refused(format!("The host cannot keep it: {e}")));
+    }
+    info!("{} gave the host {}", o.from_name, doc.name);
+    docs.rescan = true;
+    docs.next_invites = 0.0;
+    r.verdict(Verdict::Accepted(0));
 }
 
 /// From the editor who kept the edits in order while the host was away (down, or not started

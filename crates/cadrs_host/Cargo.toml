@@ -10,7 +10,10 @@ repository.workspace = true
 [dependencies]
 bevy.workspace = true
 cadrs_core.workspace = true
+cadrs_fs.workspace = true
 cadrs_net.workspace = true
+ron.workspace = true
+serde.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

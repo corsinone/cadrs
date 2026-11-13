@@ -2594,7 +2594,10 @@ version = "0.2.7"
 dependencies = [
  "bevy",
  "cadrs_core",
+ "cadrs_fs",
  "cadrs_net",
+ "ron",
+ "serde",
  "uuid",
 ]
 

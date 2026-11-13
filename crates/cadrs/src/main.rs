@@ -83,10 +83,11 @@ Usage:
       Runs a seed peer for public documents without a window: it stays in the public room and
       keeps every listing, star and published document, for others to start from. Its data dir
       defaults to ~/.local/share/cadrs/seed; it prints its cadrs ID.
-  cadrs --host [--data-dir <dir>] [--name <name>]
+  cadrs --host [--data-dir <dir>] [--name <name>] [--admin <cadrs ID>]...
       Runs a host without a window: the always-online owner of the shared documents in its
       data dir. It keeps their rooms, sends them to whoever may join and numbers everyone's
-      edits. Its data dir defaults to ~/.local/share/cadrs/host; it prints its cadrs ID.
+      edits. Its admins (kept in host.ron; --admin adds one) give it documents with Transfer
+      ownership. Its data dir defaults to ~/.local/share/cadrs/host; it prints its cadrs ID.
   cadrs --install
       Installs this build for the current user, with a launcher entry (Linux, macOS, Windows;
       `cargo install-local`).

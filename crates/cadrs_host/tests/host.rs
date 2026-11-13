@@ -2,7 +2,8 @@
 //! document in its data dir, an editor fetches it and edits it, a viewer and a stranger are
 //! kept to what they may do, the editor makes a version and the viewer comments, and all of it
 //! is on disk afterwards: the document, its history log and its comments. Then two editors and
-//! a tab one of them has open for themselves; and members added, sent the link, and leaving.
+//! a tab one of them has open for themselves; members added, sent the link, and leaving; a
+//! document handed back after the host was away; and one an admin gives the host.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentMeta;
 use cadrs_core::{Document, Store};
 use cadrs_net::bevy_iroh::{Iroh, IrohTask, Relays};
-use cadrs_net::{Ask, NetPlugin, Requests, ShareLink, Verdict, Welcome, transfer};
+use cadrs_net::{Ask, NetPlugin, Ownership, Requests, ShareLink, Verdict, Welcome, transfer};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 const TOPIC: [u8; 32] = [7; 32];
@@ -428,5 +429,68 @@ fn the_host_takes_back_what_an_editor_kept_while_it_was_away() {
     let seen = fetch(&mut host, &mut vic, &link).unwrap();
     assert_eq!(seen.snapshot.document.name, "Frame (edited offline)");
     assert_eq!(seen.snapshot.seq, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_admin_gives_the_host_a_document_and_everyone_follows_it() {
+    let mut olga = peer("Olga");
+    let mut pat = peer("Pat");
+    let mut sam = peer("Sam");
+    let dir = temp_dir();
+    cadrs_host::add_admin(&dir, &id_of(&olga)).unwrap();
+    assert!(cadrs_host::add_admin(&dir, "not an ID").is_err());
+    let mut host = App::new();
+    host.add_plugins(MinimalPlugins);
+    cadrs_host::add(&mut host, &dir, "Team host", None, Relays::Disabled);
+    let host_addr = host.world().resource::<Iroh>().addr().unwrap();
+
+    // Olga's document, shared with Pat, which she gives to the host.
+    let doc = Document::new("Bracket");
+    let mut sharing = Sharing::new(TOPIC);
+    sharing.members = vec![member(&pat, "Pat", Permission::Edit)];
+    sharing.members[0].delivered = Some(TOPIC);
+    let ownership = Ownership {
+        snapshot: Snapshot {
+            seq: 0,
+            document: doc.clone(),
+            blobs: Vec::new(),
+        },
+        sharing,
+        comments: Comments::default(),
+        from_name: "Olga".into(),
+    };
+    let link = ShareLink {
+        document: doc.id,
+        name: doc.name.clone(),
+        topic: TOPIC,
+        owner: host_addr.clone(),
+    };
+    // (The test has no address lookup: each reaches the host once, so they can dial it by ID.)
+    assert!(fetch(&mut host, &mut olga, &link).is_err());
+    assert!(fetch(&mut host, &mut sam, &link).is_err());
+
+    // Sam, who is not an admin, can't; Olga can.
+    let iroh = sam.world().resource::<Iroh>();
+    let task = transfer::start_transfer(iroh, host_addr.id, &link, &ownership);
+    assert!(matches!(
+        wait(&mut [&mut host, &mut sam], task),
+        Ok(Verdict::Refused(_))
+    ));
+    let iroh = olga.world().resource::<Iroh>();
+    let task = transfer::start_transfer(iroh, host_addr.id, &link, &ownership);
+    assert_eq!(
+        wait(&mut [&mut host, &mut olga], task),
+        Ok(Verdict::Accepted(0))
+    );
+
+    // The host owns it now: Pat and Olga, who may both edit, open it from the host.
+    let welcome = fetch(&mut host, &mut pat, &link).unwrap();
+    assert_eq!(welcome.owner_name, "Team host");
+    assert_eq!(welcome.access.permission, Permission::Edit);
+    assert_eq!(welcome.snapshot.document.name, "Bracket");
+    let welcome = fetch(&mut host, &mut olga, &link).unwrap();
+    assert_eq!(welcome.access.permission, Permission::Edit);
+    assert!(fetch(&mut host, &mut sam, &link).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
