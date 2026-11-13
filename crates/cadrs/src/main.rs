@@ -106,8 +106,12 @@ Usage:
         [--link off|view|edit] [--data-dir <dir>]
       Shows one of a host's documents, after making users its maintainers or no longer, or
       changing whom it is shared with (which the host makes, as it would for a peer).
-  cadrs --host-settings [--public on|off] [--data-dir <dir>]
-      Shows a host's settings, after changing them; a running host follows them.
+  cadrs --host-settings [--public on|off] [--page <address>|off] [--sign-in-header <name>]
+        [--data-dir <dir>]
+      Shows a host's settings, after changing them; a running host follows the public room.
+      --page serves its admin page on that address of the machine itself (127.0.0.1:8090),
+      from its next start, for a sign-in gateway in front of it (tools/host/gateway), which
+      names whoever signed in in a header (Remote-User unless --sign-in-header says).
   cadrs --host-backup <folder> [--data-dir <dir>]
       Copies a host's data dir into a new folder, consistently even while it runs, and reads
       the copy back.

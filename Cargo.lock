@@ -2592,12 +2592,15 @@ dependencies = [
 name = "cadrs_host"
 version = "0.2.7"
 dependencies = [
+ "axum",
  "bevy",
  "cadrs_core",
  "cadrs_fs",
  "cadrs_net",
+ "form_urlencoded",
  "ron",
  "serde",
+ "tokio",
  "uuid",
 ]
 

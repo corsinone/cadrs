@@ -125,6 +125,15 @@ impl Users {
             {
                 return Err(format!("Two users are called {}", u.name));
             }
+            if let Some(s) = &u.sign_in
+                && let Some(o) = self.users[..i].iter().find(|o| {
+                    o.sign_in
+                        .as_ref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(s))
+                })
+            {
+                return Err(format!("{} and {} both sign in as {s}", o.name, u.name));
+            }
             for id in &u.ids {
                 if id.parse::<EndpointId>().is_err() {
                     return Err(format!("{id} ({}) is not a cadrs ID", u.name));
@@ -151,6 +160,15 @@ impl Users {
         Ok(())
     }
 
+    /// Who signs in (with the team's sign-in) as `sign_in`.
+    pub fn by_sign_in(&self, sign_in: &str) -> Option<&User> {
+        self.users.iter().find(|u| {
+            u.sign_in
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(sign_in.trim()))
+        })
+    }
+
     /// Whose cadrs ID `id` is.
     pub fn by_id(&self, id: &str) -> Option<&User> {
         self.users.iter().find(|u| u.ids.iter().any(|i| i == id))
@@ -170,14 +188,17 @@ impl Users {
     /// Whether the owner of cadrs ID `id` manages `document`: an admin, or one of its
     /// maintainers.
     pub fn maintains(&self, id: &str, document: DocumentId) -> bool {
-        self.by_id(id).is_some_and(|u| {
-            u.role == Role::Admin
-                || (u.role >= Role::Maintainer
-                    && self
-                        .maintainers
-                        .get(&document)
-                        .is_some_and(|m| m.iter().any(|n| n.eq_ignore_ascii_case(&u.name))))
-        })
+        self.by_id(id).is_some_and(|u| self.manages(u, document))
+    }
+
+    /// Whether `user` manages `document`: an admin, or one of its maintainers.
+    pub fn manages(&self, user: &User, document: DocumentId) -> bool {
+        user.role == Role::Admin
+            || (user.role >= Role::Maintainer
+                && self
+                    .maintainers_of(document)
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&user.name)))
     }
 
     /// The names of the maintainers of `document`.

@@ -16,5 +16,12 @@ ron.workspace = true
 serde.workspace = true
 uuid.workspace = true
 
+# The admin page, served by axum on a runtime of its own (as cadrs_mcp does); a page never
+# runs a host.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum.workspace = true
+form_urlencoded.workspace = true
+tokio = { workspace = true, features = ["rt", "net"] }
+
 [dev-dependencies]
 uuid.workspace = true

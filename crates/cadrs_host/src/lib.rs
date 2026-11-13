@@ -39,6 +39,8 @@
 //! private documents, and the seed peer does the public ones.
 
 pub mod admin;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod page;
 pub mod users;
 
 use std::collections::HashMap;
@@ -98,6 +100,35 @@ struct Settings {
     /// turns it on.
     #[serde(default)]
     public: bool,
+    /// Where the admin page listens, if anywhere: an address on the machine itself, which only
+    /// the sign-in gateway reaches ([`page`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<String>,
+    /// The header in which the gateway names whoever signed in; `Remote-User` (Authelia's) if
+    /// not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sign_in_header: Option<String>,
+}
+
+impl Settings {
+    fn sign_in_header(&self) -> &str {
+        self.sign_in_header.as_deref().unwrap_or("Remote-User")
+    }
+}
+
+/// `address` as the admin page's: on the machine itself only, so that only the sign-in gateway
+/// in front of it reaches it (the page believes the header the gateway sets).
+fn page_address(address: &str) -> Result<std::net::SocketAddr, String> {
+    let a: std::net::SocketAddr = address
+        .parse()
+        .map_err(|_| format!("{address}: give an address and port, as 127.0.0.1:8090"))?;
+    if !a.ip().is_loopback() {
+        return Err(format!(
+            "{address}: the admin page listens only on the machine itself (127.0.0.1 or ::1), \
+             behind the sign-in gateway"
+        ));
+    }
+    Ok(a)
 }
 
 fn read_settings(dir: &Path) -> Result<Settings, String> {
@@ -151,7 +182,10 @@ fn edit_settings(dir: &Path, f: impl FnOnce(&mut Settings)) -> Result<(), String
     let text = ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default())
         .map_err(|e| e.to_string())?;
     let path = dir.join(SETTINGS_FILE);
-    cadrs_fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+    let tmp = path.with_extension("ron.tmp");
+    cadrs_fs::write(&tmp, text)
+        .and_then(|_| cadrs_fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// `Some` when the arguments ask for a host.
@@ -393,6 +427,24 @@ pub fn run(host: Host) -> AppExit {
             );
             if settings.public {
                 println!("In the public room (--public off to leave it).");
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(address) = &settings.page {
+                let started = page_address(address).and_then(|a| {
+                    let header = settings.sign_in_header().to_string();
+                    page::start(host.dir.clone(), a, header).map_err(|e| format!("{a}: {e}"))
+                });
+                match started {
+                    Ok(a) => println!(
+                        "Admin page on http://{a}, for the sign-in gateway, which names whoever \
+                         signed in in the {} header",
+                        settings.sign_in_header()
+                    ),
+                    Err(e) => {
+                        eprintln!("cannot serve the admin page: {e}");
+                        return AppExit::from_code(2);
+                    }
+                }
             }
         }
         None => {

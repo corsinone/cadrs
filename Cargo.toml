@@ -108,6 +108,8 @@ rmcp = { version = "3.5", default-features = false, features = ["server", "macro
 tokio = { version = "1", default-features = false }
 tokio-util = "0.7"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Forms posted to the host's admin page (cadrs_host).
+form_urlencoded = "1"
 # Sharing and collaboration (cadrs_net): peers over iroh, no server. Only the transport, rooms
 # and typed messages; the voice and video features stay off (MIT/Apache-2.0).
 bevy_iroh = { version = "0.5", default-features = false }

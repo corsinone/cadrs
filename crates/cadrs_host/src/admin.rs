@@ -9,7 +9,8 @@
 //! - `cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...
 //!   [--edit <user>]... [--view <user>]... [--unshare <user or cadrs ID>]...
 //!   [--link off|view|edit]`: one document, who maintains it and whom it is shared with.
-//! - `cadrs --host-settings [--public on|off]`: the host's settings.
+//! - `cadrs --host-settings [--public on|off] [--page <address>|off] [--sign-in-header <name>]`:
+//!   the host's settings, its admin page's among them ([`crate::page`]).
 //! - `cadrs --host-backup <folder>`: a consistent copy of the data dir ([`backup`]).
 //!
 //! Each takes `--data-dir <dir>`, as `cadrs --host` does.
@@ -128,15 +129,7 @@ pub struct Admin {
 
 enum Command {
     Users,
-    User {
-        name: String,
-        role: Option<Role>,
-        sign_in: Option<String>,
-        ids: Vec<String>,
-        forget: Vec<String>,
-        rename: Option<String>,
-        remove: bool,
-    },
+    User(UserEdit),
     Documents,
     Document {
         which: String,
@@ -145,10 +138,111 @@ enum Command {
     },
     Settings {
         public: Option<bool>,
+        page: Option<Option<String>>,
+        sign_in_header: Option<String>,
     },
     Backup {
         to: PathBuf,
     },
+}
+
+/// A user to add, change or remove (`--host-user`, or the admin page).
+#[derive(Debug, Default)]
+pub(crate) struct UserEdit {
+    pub name: String,
+    pub role: Option<Role>,
+    /// Their sign-in; empty to forget it.
+    pub sign_in: Option<String>,
+    pub ids: Vec<String>,
+    pub forget: Vec<String>,
+    pub rename: Option<String>,
+    pub remove: bool,
+}
+
+/// Makes `edit` in the users of the host in `dir`: the users now, what was done, and the
+/// user's name now (`None` once removed).
+pub(crate) fn edit_user(
+    dir: &Path,
+    edit: UserEdit,
+) -> Result<(Users, &'static str, Option<String>), String> {
+    let UserEdit {
+        name,
+        role,
+        sign_in,
+        ids,
+        forget,
+        rename,
+        remove,
+    } = edit;
+    let (users, (said, name)) = Users::edit(dir, |users| {
+        if remove {
+            return users.remove(&name).map(|_| ("Removed", None));
+        }
+        let added = users.by_name(&name).is_none();
+        if added {
+            users.users.push(User {
+                name: name.trim().to_string(),
+                role: role.unwrap_or(Role::Collaborator),
+                sign_in: None,
+                ids: Vec::new(),
+            });
+        }
+        let user = users
+            .users
+            .iter_mut()
+            .find(|u| u.name.eq_ignore_ascii_case(name.trim()))
+            .expect("just added");
+        if let Some(role) = role {
+            user.role = role;
+        }
+        if let Some(s) = sign_in {
+            let s = s.trim();
+            user.sign_in = (!s.is_empty()).then(|| s.to_string());
+        }
+        for id in ids {
+            if !user.ids.contains(&id) {
+                user.ids.push(id);
+            }
+        }
+        for id in forget {
+            if !user.ids.contains(&id) {
+                return Err(format!("{} doesn't use {id}", user.name));
+            }
+            user.ids.retain(|i| *i != id);
+        }
+        let (current, role) = (user.name.clone(), user.role);
+        // A collaborator maintains nothing.
+        if role < Role::Maintainer {
+            for list in users.maintainers.values_mut() {
+                list.retain(|n| !n.eq_ignore_ascii_case(&current));
+            }
+            users.maintainers.retain(|_, l| !l.is_empty());
+        }
+        let current = match rename {
+            Some(to) => {
+                users.rename(&current, &to)?;
+                to.trim().to_string()
+            }
+            None => current,
+        };
+        Ok((if added { "Added" } else { "Changed" }, Some(current)))
+    })?;
+    Ok((users, said, name))
+}
+
+/// Checks that `what` can be made to `document`'s sharing, so a mistake is said at once (the
+/// host makes it later).
+pub(crate) fn check_change(
+    users: &Users,
+    document: &DocumentEntry,
+    what: &[Share],
+) -> Result<(), String> {
+    let mut sharing = document
+        .meta
+        .sharing
+        .clone()
+        .unwrap_or(Sharing::new([0; 32]));
+    share(&mut sharing, users, what).map(|_| ())
 }
 
 /// `Some` when the arguments ask for one of the commands.
@@ -162,7 +256,7 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
     let mut command = None;
     let (mut role, mut sign_in, mut rename, mut remove) = (None, None, None, false);
     let (mut ids, mut forget, mut maintainers) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut sharing, mut public) = (Vec::new(), None);
+    let (mut sharing, mut public, mut page, mut header) = (Vec::new(), None, None, None);
     // The options given, to check they go with the command.
     let mut options = Vec::new();
     let mut it = args.iter();
@@ -177,21 +271,20 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
         let new = match a {
             "--host-users" => Some(Command::Users),
             "--host-documents" => Some(Command::Documents),
-            "--host-user" => Some(Command::User {
+            "--host-user" => Some(Command::User(UserEdit {
                 name: value(a, &mut it)?,
-                role: None,
-                sign_in: None,
-                ids: Vec::new(),
-                forget: Vec::new(),
-                rename: None,
-                remove: false,
-            }),
+                ..UserEdit::default()
+            })),
             "--host-document" => Some(Command::Document {
                 which: value(a, &mut it)?,
                 maintainers: Vec::new(),
                 sharing: Vec::new(),
             }),
-            "--host-settings" => Some(Command::Settings { public: None }),
+            "--host-settings" => Some(Command::Settings {
+                public: None,
+                page: None,
+                sign_in_header: None,
+            }),
             "--host-backup" => Some(Command::Backup {
                 to: PathBuf::from(value(a, &mut it)?),
             }),
@@ -241,6 +334,11 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
                     other => return Err(format!("--public {other}: on or off")),
                 })
             }
+            "--page" => {
+                let v = value(a, &mut it)?;
+                page = Some((v != "off").then_some(v));
+            }
+            "--sign-in-header" => header = Some(value(a, &mut it)?),
             other => return Err(format!("{other}: not an option of the --host-... commands")),
         }
         if a != "--data-dir" {
@@ -249,7 +347,7 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
     }
     let mut command = command.ok_or("no --host-... command")?;
     let allowed: &[&str] = match &mut command {
-        Command::User {
+        Command::User(UserEdit {
             role: r,
             sign_in: s,
             ids: i,
@@ -257,7 +355,7 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
             rename: n,
             remove: d,
             ..
-        } => {
+        }) => {
             (*r, *s, *i, *f, *n, *d) = (role, sign_in, ids, forget, rename, remove);
             &[
                 "--role",
@@ -283,9 +381,13 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
                 "--link",
             ]
         }
-        Command::Settings { public: p } => {
-            *p = public;
-            &["--public"]
+        Command::Settings {
+            public: p,
+            page: g,
+            sign_in_header: h,
+        } => {
+            (*p, *g, *h) = (public, page, header);
+            &["--public", "--page", "--sign-in-header"]
         }
         _ => &[],
     };
@@ -313,74 +415,14 @@ pub fn run(admin: Admin) -> u8 {
                 print_user(&users, u, &names);
             }
         }),
-        Command::User {
-            name,
-            role,
-            sign_in,
-            ids,
-            forget,
-            rename,
-            remove,
-        } => Users::edit(dir, |users| {
-            if remove {
-                return users
-                    .remove(&name)
-                    .map(|u| (format!("Removed {}", u.name), None));
-            }
-            let added = users.by_name(&name).is_none();
-            if added {
-                users.users.push(User {
-                    name: name.clone(),
-                    role: role.unwrap_or(Role::Collaborator),
-                    sign_in: None,
-                    ids: Vec::new(),
-                });
-            }
-            let user = users
-                .users
-                .iter_mut()
-                .find(|u| u.name.eq_ignore_ascii_case(&name))
-                .expect("just added");
-            if let Some(role) = role {
-                user.role = role;
-            }
-            if let Some(s) = sign_in {
-                user.sign_in = (!s.is_empty()).then_some(s);
-            }
-            for id in ids {
-                if !user.ids.contains(&id) {
-                    user.ids.push(id);
+        Command::User(edit) => edit_user(dir, edit).map(|(users, said, name)| match name {
+            Some(name) => {
+                println!("{said}:");
+                if let Some(u) = users.by_name(&name) {
+                    print_user(&users, u, &document_names(dir));
                 }
             }
-            for id in forget {
-                if !user.ids.contains(&id) {
-                    return Err(format!("{} doesn't use {id}", user.name));
-                }
-                user.ids.retain(|i| *i != id);
-            }
-            let (current, role) = (user.name.clone(), user.role);
-            // A collaborator maintains nothing.
-            if role < Role::Maintainer {
-                for list in users.maintainers.values_mut() {
-                    list.retain(|n| !n.eq_ignore_ascii_case(&current));
-                }
-                users.maintainers.retain(|_, l| !l.is_empty());
-            }
-            let current = match rename {
-                Some(to) => {
-                    users.rename(&current, &to)?;
-                    to
-                }
-                None => current,
-            };
-            let said = if added { "Added" } else { "Changed" };
-            Ok((format!("{said}:"), Some(current)))
-        })
-        .map(|(users, (said, name))| {
-            println!("{said}");
-            if let Some(u) = name.and_then(|n| users.by_name(&n)) {
-                print_user(&users, u, &document_names(dir));
-            }
+            None => println!("{said}"),
         }),
         Command::Documents => Users::read(dir).map(|users| {
             let mine = owned(dir);
@@ -406,9 +448,7 @@ pub fn run(admin: Admin) -> u8 {
                 .0
             };
             if !sharing.is_empty() {
-                // Checked here, so a mistake is said now; made by the host.
-                let mut check = e.meta.sharing.clone().unwrap_or(Sharing::new([0; 32]));
-                share(&mut check, &users, &sharing)?;
+                check_change(&users, &e, &sharing)?;
                 let change = SharingChange {
                     document: e.id,
                     what: sharing,
@@ -425,12 +465,38 @@ pub fn run(admin: Admin) -> u8 {
             print_document(&users, &e);
             Ok(())
         }),
-        Command::Settings { public } => {
-            let set = public.map_or(Ok(()), |on| crate::set_public(dir, on));
+        Command::Settings {
+            public,
+            page,
+            sign_in_header,
+        } => {
+            let page = page.map(|p| p.map(|a| crate::page_address(&a).map(|_| a)).transpose());
+            let set = match page {
+                Some(Err(e)) => Err(e),
+                page => crate::edit_settings(dir, |s| {
+                    if let Some(on) = public {
+                        s.public = on;
+                    }
+                    if let Some(Ok(p)) = page {
+                        s.page = p;
+                    }
+                    if let Some(h) = sign_in_header {
+                        s.sign_in_header = Some(h);
+                    }
+                }),
+            };
             set.and_then(|_| crate::read_settings(dir)).map(|s| {
                 let on = if s.public { "on" } else { "off" };
                 println!("Settings of the host in {}", dir.display());
                 println!("    public room: {on} (--public on|off; a running host follows it)");
+                match &s.page {
+                    Some(a) => println!(
+                        "    admin page: http://{a}, signed in by the gateway's {} header \
+                         (--page <address>|off, --sign-in-header <name>; from the host's next start)",
+                        s.sign_in_header()
+                    ),
+                    None => println!("    admin page: off (--page 127.0.0.1:<port>)"),
+                }
             })
         }
         Command::Backup { to } => backup(dir, &to).map(|n| {
@@ -450,8 +516,8 @@ pub fn run(admin: Admin) -> u8 {
     }
 }
 
-/// Gives `change` to the host, and waits for it to be made: whether it was.
-fn ask_host(dir: &Path, change: &SharingChange) -> Result<bool, String> {
+/// Leaves `change` for the host in `dir`: where, until it is made.
+pub(crate) fn queue_change(dir: &Path, change: &SharingChange) -> Result<PathBuf, String> {
     let changes = dir.join(CHANGES_DIR);
     cadrs_fs::create_dir_all(&changes).map_err(|e| format!("{}: {e}", changes.display()))?;
     // Named so the host makes them in the order they were asked.
@@ -465,6 +531,12 @@ fn ask_host(dir: &Path, change: &SharingChange) -> Result<bool, String> {
     cadrs_fs::write(&tmp, text)
         .and_then(|_| cadrs_fs::rename(&tmp, &path))
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Gives `change` to the host, and waits for it to be made: whether it was.
+fn ask_host(dir: &Path, change: &SharingChange) -> Result<bool, String> {
+    let path = queue_change(dir, change)?;
     let start = std::time::Instant::now();
     while start.elapsed() < WAIT_FOR_HOST {
         if !cadrs_fs::exists(&path) {
@@ -476,7 +548,7 @@ fn ask_host(dir: &Path, change: &SharingChange) -> Result<bool, String> {
 }
 
 /// The documents the host owns (not copies of others' documents), newest first.
-fn owned(dir: &Path) -> Vec<DocumentEntry> {
+pub(crate) fn owned(dir: &Path) -> Vec<DocumentEntry> {
     let (library, errors) = Store::new(dir).list();
     for (path, e) in errors {
         eprintln!("cannot read {}: {e}", path.display());
@@ -495,7 +567,7 @@ fn document_names(dir: &Path) -> Vec<(DocumentId, String)> {
 }
 
 /// The document named `which` (its name, whatever the case, or its id).
-fn find(dir: &Path, which: &str) -> Result<DocumentEntry, String> {
+pub(crate) fn find(dir: &Path, which: &str) -> Result<DocumentEntry, String> {
     let mut found: Vec<DocumentEntry> = owned(dir)
         .into_iter()
         .filter(|e| e.id.to_string() == which || e.name.eq_ignore_ascii_case(which))
