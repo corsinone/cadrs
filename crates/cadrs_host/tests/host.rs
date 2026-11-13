@@ -5,7 +5,8 @@
 //! a tab one of them has open for themselves; members added, sent the link, and leaving; a
 //! document handed back after the host was away; one a maintainer gives the host; the public
 //! room, which the host stays out of unless it is turned on; a restart; the host's users, the
-//! only ones it answers, and the commands that change them; and a backup.
+//! only ones it answers, and the commands that change them and whom a document is shared with;
+//! and a backup.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -567,6 +568,23 @@ fn the_host_stays_out_of_the_public_room_unless_turned_on() {
     assert!(in_public_room(&dir));
     cadrs_host::set_public(&dir, false).unwrap();
     assert!(!in_public_room(&dir));
+
+    // A running host follows the setting.
+    let mut host = App::new();
+    host.add_plugins(MinimalPlugins);
+    cadrs_host::add(&mut host, &dir, "Team host", None, Relays::Disabled);
+    host.update();
+    assert_eq!(command(&dir, &["--host-settings", "--public", "on"]), 0);
+    let start = Instant::now();
+    while !host
+        .world()
+        .resource::<cadrs_net::public::PublicEnabled>()
+        .0
+    {
+        host.update();
+        assert!(start.elapsed() < PATIENCE, "the host stayed out");
+        std::thread::sleep(Duration::from_millis(16));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -651,6 +669,95 @@ fn the_host_answers_only_its_users_and_takes_new_ones_as_they_come() {
         std::thread::sleep(Duration::from_millis(200));
     };
     assert_eq!(welcome.access.permission, Permission::Edit);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_admin_changes_whom_a_document_is_shared_with_from_the_command_line() {
+    let mut ann = peer("Ann");
+    let mut bea = peer("Bea");
+    let dir = temp_dir();
+    let store = Store::new(&dir);
+    let doc = Document::new("Frame");
+    user(&dir, &bea, "Bea", Role::Collaborator);
+    let (mut host, link) = host_with(&dir, &doc, vec![member(&ann, "Ann", Permission::Edit)]);
+    // (Bea reaches the host once, so it can dial her later, as in the other tests.)
+    assert!(fetch(&mut host, &mut bea, &link).is_err());
+
+    // The command, with the host running meanwhile: it waits for the host to make it.
+    let run = |host: &mut App, args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let dir = dir.clone();
+        let task = std::thread::spawn(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            command(&dir, &args)
+        });
+        while !task.is_finished() {
+            host.update();
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        task.join().unwrap()
+    };
+
+    // Bea may view it now.
+    assert_eq!(
+        run(&mut host, &["--host-document", "Frame", "--view", "Bea"]),
+        0
+    );
+    let welcome = fetch(&mut host, &mut bea, &link).unwrap();
+    assert_eq!(welcome.access.permission, Permission::View);
+    // A mistake is said at once, and changes nothing.
+    assert_eq!(
+        run(&mut host, &["--host-document", "Frame", "--edit", "Nobody"]),
+        1
+    );
+
+    // Ann no longer: without link sharing, the document moves to a fresh room, so her link
+    // stops working, and Bea is sent the new one.
+    assert_eq!(
+        run(&mut host, &["--host-document", "Frame", "--unshare", "Ann"]),
+        0
+    );
+    let topic = store.load(doc.id).unwrap().meta.sharing.unwrap().topic;
+    assert_ne!(topic, TOPIC);
+    assert!(fetch(&mut host, &mut ann, &link).is_err());
+    let start = Instant::now();
+    let moved = loop {
+        host.update();
+        bea.update();
+        let asks = bea.world_mut().resource_mut::<Requests>().drain();
+        // (Her first link, to the old room, may come first.)
+        let mut new = None;
+        for r in asks {
+            if let Ask::Invite(invite) = &r.ask {
+                let sent: ShareLink = invite.link.parse().unwrap();
+                if sent.topic == topic {
+                    new = Some(sent);
+                }
+                r.verdict(Verdict::Accepted(0));
+            }
+        }
+        if let Some(sent) = new {
+            break sent;
+        }
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the host never sent the new link"
+        );
+        std::thread::sleep(Duration::from_millis(16));
+    };
+    let start = Instant::now();
+    let welcome = loop {
+        if let Ok(w) = fetch(&mut host, &mut bea, &moved) {
+            break w;
+        }
+        assert!(
+            start.elapsed() < PATIENCE,
+            "the host never opened the new room"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(welcome.access.permission, Permission::View);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -741,6 +848,8 @@ fn the_commands_look_after_users_and_maintainers() {
     };
     assert!(bad(&["--host-users", "--role", "admin"]));
     assert!(bad(&["--host-user", "Ada", "--role", "boss"]));
+    assert!(bad(&["--host-document", "Bracket", "--link", "maybe"]));
+    assert!(bad(&["--host-user", "Ada", "--edit", "Bob"]));
     assert!(cadrs_host::admin::parse(&["--host".to_string()]).is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }

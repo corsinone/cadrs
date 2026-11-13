@@ -31,7 +31,8 @@
 //! host and transfer it, the host sends everyone it is shared with the new link, and they
 //! maintain it from then on. The maintainers of a document and the admins may share it with
 //! more people (users only) whatever their own access. [`admin`] has the commands that list
-//! and change all of this, and the backup.
+//! and change all of this (whom a document is shared with too, which the host then makes as
+//! it would for a peer), and the backup.
 //!
 //! The host stays out of the public room (public documents, the check-in at peers.cadrs.net)
 //! unless an admin turns it on (`--public on`, kept in `host.ron`): it is there for the team's
@@ -506,6 +507,21 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
     *last = Some(t);
     let store = world.resource::<Documents>().store.clone();
     read_users(&mut world.resource_mut::<Documents>());
+    // The public room, as an admin last set it (`cadrs --host-settings`).
+    if let Ok(settings) = read_settings(store.root())
+        && let Some(mut on) = world.get_resource_mut::<cadrs_net::public::PublicEnabled>()
+        && on.0 != settings.public
+    {
+        on.0 = settings.public;
+        info!(
+            "{} the public room",
+            if settings.public {
+                "joining"
+            } else {
+                "leaving"
+            }
+        );
+    }
     let (library, errors) = store.list();
     for (path, e) in errors {
         warn!("cannot read {}: {e}", path.display());
@@ -563,6 +579,88 @@ fn scan(world: &mut World, mut last: Local<Option<f64>>) {
             },
         );
     }
+    take_changes(world);
+}
+
+/// Makes the sharing changes admins asked for from the command line (`cadrs --host-document`),
+/// in the order they were asked: each a file in `changes/`, gone once made.
+fn take_changes(world: &mut World) {
+    let dir = world
+        .resource::<Documents>()
+        .store
+        .root()
+        .join(admin::CHANGES_DIR);
+    let Ok(read) = cadrs_fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = read
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "ron"))
+        .collect();
+    files.sort();
+    for path in files {
+        let change = cadrs_fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| ron::from_str::<admin::SharingChange>(&t).map_err(|e| e.to_string()))
+            .and_then(|c| change_sharing(world, &c));
+        if let Err(e) = cadrs_fs::remove_file(&path) {
+            error!("cannot take {}: {e}", path.display());
+        }
+        match change {
+            Ok(said) => info!("{said}"),
+            Err(e) => warn!("cannot make the change in {}: {e}", path.display()),
+        }
+    }
+}
+
+/// Changes whom a document is shared with, as an admin asked: everyone in its room hears the
+/// new access, new members are sent the link, and it moves to a fresh room when someone was
+/// removed without link sharing, or link sharing was turned off. What was done, for the log.
+fn change_sharing(world: &mut World, c: &admin::SharingChange) -> Result<String, String> {
+    let mut docs = world.resource_mut::<Documents>();
+    let docs = &mut *docs;
+    let (name, said, told) = if let Some(h) = docs.open.get_mut(&c.document) {
+        let sharing = h.meta.sharing.as_mut().ok_or("It isn't shared")?;
+        let (rotate, said) = admin::share(sharing, &docs.users, &c.what)?;
+        // The old room hears it before the document leaves it.
+        let told = h.access_changed(c.document).map(|m| (h.room, m));
+        if rotate && let Some(s) = h.meta.sharing.as_mut() {
+            s.rotate(random_topic());
+        }
+        docs.store
+            .save(&h.confirmed, &h.meta)
+            .map_err(|e| e.to_string())?;
+        (h.name.clone(), said, told)
+    } else {
+        let mut file = docs.store.load(c.document).map_err(|e| e.to_string())?;
+        if file.meta.shared.is_some() {
+            return Err("It is someone else's document".into());
+        }
+        let sharing = file
+            .meta
+            .sharing
+            .get_or_insert_with(|| cadrs_core::collab::Sharing::new(random_topic()));
+        let (rotate, said) = admin::share(sharing, &docs.users, &c.what)?;
+        if rotate {
+            sharing.rotate(random_topic());
+        }
+        docs.store
+            .save(&file.document, &file.meta)
+            .map_err(|e| e.to_string())?;
+        (file.document.name, said, None)
+    };
+    docs.next_invites = 0.0;
+    docs.rescan = true;
+    world.resource_mut::<Outbox>().0.extend(told);
+    Ok(format!("{name}: {}", said.join(", ")))
+}
+
+/// A fresh room's topic (as the app makes them).
+fn random_topic() -> [u8; 32] {
+    let mut t = [0; 32];
+    t[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    t[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    t
 }
 
 /// Takes the users as `users.ron` has them now (an admin may have changed them); keeps the

@@ -17,9 +17,8 @@ ssh <server> 'cd /srv/cadrs-host/build && docker build -t cadrs-host . \
   --network host -v /srv/cadrs-host/data:/data cadrs-host --name "Team host"'
 ```
 
-`docker logs cadrs-host` shows its cadrs ID. Anything after the image name goes to
-`cadrs --host`: `--public on` puts it in the public room, which it stays out of otherwise (kept
-in `/data/host.ron`).
+`docker logs cadrs-host` shows its cadrs ID. It stays out of the public room unless an admin
+turns it on (`--host-settings --public on` below, kept in `/data/host.ron`).
 
 The host answers only its users (`/data/users.ron`), each a person with a role and the cadrs
 IDs they use, one for each device: maintainers and admins give it documents with **Transfer
@@ -32,9 +31,15 @@ docker exec cadrs-host cadrs --host-user "Ada" --role admin --id <cadrs ID> --da
 docker exec cadrs-host cadrs --host-users --data-dir /data
 docker exec cadrs-host cadrs --host-documents --data-dir /data
 docker exec cadrs-host cadrs --host-document "Bracket" --maintainer "Ada" --data-dir /data
+docker exec cadrs-host cadrs --host-document "Bracket" --edit "Ada" --view "Bob" --data-dir /data
+docker exec cadrs-host cadrs --host-settings --public on --data-dir /data
 ```
 
-`cadrs --help` lists them all (`--rename`, `--remove`, `--forget-id`...).
+Sharing a document with a user shares it with each of their cadrs IDs; the host makes the
+change as it would one from the app's Share dialog, so everyone in the document hears it, and
+`--unshare` (without link sharing) or `--link off` moves the document to a fresh room whose link
+only its members get. `cadrs --help` lists every option (`--rename`, `--remove`,
+`--forget-id`...).
 
 `docker stop cadrs-host` sends Ctrl+C (the image's `STOPSIGNAL`): the host saves every edit and
 history log before it stops.

@@ -6,20 +6,120 @@
 //!   [--id <cadrs ID>]... [--forget-id <cadrs ID>]... [--rename <new name>] [--remove]`: adds
 //!   a user, or changes or removes one.
 //! - `cadrs --host-documents`: the documents, with their maintainers and who can open them.
-//! - `cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...`:
-//!   one document, and who maintains it.
+//! - `cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...
+//!   [--edit <user>]... [--view <user>]... [--unshare <user or cadrs ID>]...
+//!   [--link off|view|edit]`: one document, who maintains it and whom it is shared with.
+//! - `cadrs --host-settings [--public on|off]`: the host's settings.
 //! - `cadrs --host-backup <folder>`: a consistent copy of the data dir ([`backup`]).
 //!
 //! Each takes `--data-dir <dir>`, as `cadrs --host` does.
+//!
+//! A change to whom a document is shared with goes to the host as a file in `changes/` in its
+//! data dir ([`SharingChange`]), which it makes as it scans, as it would the same change asked
+//! by a peer: everyone in the room hears the new access, new members are sent the link, and
+//! the document moves to a fresh room when someone is removed from it without link sharing,
+//! or link sharing is turned off (as the app does). A host that isn't running makes it when it
+//! starts.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use cadrs_core::collab::{Member, Permission, Sharing};
 use cadrs_core::history_log::HistoryLog;
 use cadrs_core::library::DocumentEntry;
 use cadrs_core::{DocumentId, Store};
+use cadrs_net::bevy_iroh::iroh::EndpointId;
 
 use crate::users::{Role, User, Users};
+
+/// Where the sharing changes asked from the command line wait for the host, in its data dir.
+pub const CHANGES_DIR: &str = "changes";
+
+/// How long `--host-document` waits for a running host to make its change.
+const WAIT_FOR_HOST: Duration = Duration::from_secs(15);
+
+/// Changes to whom a document is shared with, for the host to make.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SharingChange {
+    pub document: DocumentId,
+    pub what: Vec<Share>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Share {
+    /// Share it with a user (each of their cadrs IDs), or change what they may do.
+    With {
+        user: String,
+        permission: Permission,
+    },
+    /// No longer share it with a user, or with one cadrs ID.
+    Not(String),
+    /// Link sharing: anyone with the link who is a user gets this; `None` turns it off.
+    Link(Option<Permission>),
+}
+
+/// Makes `what` to `sharing`, all or nothing: whether the document has to move to a fresh room
+/// now, and what was done, for the log.
+pub(crate) fn share(
+    sharing: &mut Sharing,
+    users: &Users,
+    what: &[Share],
+) -> Result<(bool, Vec<String>), String> {
+    let mut s = sharing.clone();
+    let (mut rotate, mut said) = (false, Vec::new());
+    for w in what {
+        match w {
+            Share::With { user, permission } => {
+                let u = users
+                    .by_name(user)
+                    .ok_or_else(|| format!("No user is called {user}"))?;
+                if u.ids.is_empty() {
+                    return Err(format!("{} has no cadrs ID yet", u.name));
+                }
+                for id in &u.ids {
+                    match s.members.iter_mut().find(|m| m.id == *id) {
+                        Some(m) => {
+                            m.permission = *permission;
+                            m.rights = None;
+                        }
+                        None => s.members.push(Member {
+                            id: id.clone(),
+                            name: u.name.clone(),
+                            permission: *permission,
+                            rights: None,
+                            delivered: None,
+                        }),
+                    }
+                }
+                said.push(format!("{}: {}", u.name, permission.label()));
+            }
+            Share::Not(who) => {
+                let ids = match users.by_name(who) {
+                    Some(u) => u.ids.clone(),
+                    None if who.parse::<EndpointId>().is_ok() => vec![who.clone()],
+                    None => return Err(format!("No user is called {who}")),
+                };
+                let before = s.members.len();
+                s.members.retain(|m| !ids.contains(&m.id));
+                if s.members.len() == before {
+                    return Err(format!("It isn't shared with {who}"));
+                }
+                rotate |= s.link.is_none();
+                said.push(format!("no longer shared with {who}"));
+            }
+            Share::Link(p) => {
+                rotate |= s.link.is_some() && p.is_none();
+                s.link = *p;
+                said.push(match p {
+                    Some(p) => format!("anyone with the link who is a user: {}", p.label()),
+                    None => "link sharing off".into(),
+                });
+            }
+        }
+    }
+    *sharing = s;
+    Ok((rotate, said))
+}
 
 pub struct Admin {
     dir: PathBuf,
@@ -41,6 +141,10 @@ enum Command {
     Document {
         which: String,
         maintainers: Vec<(String, bool)>,
+        sharing: Vec<Share>,
+    },
+    Settings {
+        public: Option<bool>,
     },
     Backup {
         to: PathBuf,
@@ -58,6 +162,7 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
     let mut command = None;
     let (mut role, mut sign_in, mut rename, mut remove) = (None, None, None, false);
     let (mut ids, mut forget, mut maintainers) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sharing, mut public) = (Vec::new(), None);
     // The options given, to check they go with the command.
     let mut options = Vec::new();
     let mut it = args.iter();
@@ -84,7 +189,9 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
             "--host-document" => Some(Command::Document {
                 which: value(a, &mut it)?,
                 maintainers: Vec::new(),
+                sharing: Vec::new(),
             }),
+            "--host-settings" => Some(Command::Settings { public: None }),
             "--host-backup" => Some(Command::Backup {
                 to: PathBuf::from(value(a, &mut it)?),
             }),
@@ -112,6 +219,28 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
             "--remove" => remove = true,
             "--maintainer" => maintainers.push((value(a, &mut it)?, true)),
             "--not-maintainer" => maintainers.push((value(a, &mut it)?, false)),
+            "--edit" | "--view" => sharing.push(Share::With {
+                user: value(a, &mut it)?,
+                permission: if a == "--edit" {
+                    Permission::Edit
+                } else {
+                    Permission::View
+                },
+            }),
+            "--unshare" => sharing.push(Share::Not(value(a, &mut it)?)),
+            "--link" => sharing.push(Share::Link(match value(a, &mut it)?.as_str() {
+                "off" => None,
+                "view" => Some(Permission::View),
+                "edit" => Some(Permission::Edit),
+                other => return Err(format!("--link {other}: off, view or edit")),
+            })),
+            "--public" => {
+                public = Some(match value(a, &mut it)?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--public {other}: on or off")),
+                })
+            }
             other => return Err(format!("{other}: not an option of the --host-... commands")),
         }
         if a != "--data-dir" {
@@ -139,9 +268,24 @@ fn parse_command(args: &[String]) -> Result<Admin, String> {
                 "--remove",
             ]
         }
-        Command::Document { maintainers: m, .. } => {
-            *m = maintainers;
-            &["--maintainer", "--not-maintainer"]
+        Command::Document {
+            maintainers: m,
+            sharing: s,
+            ..
+        } => {
+            (*m, *s) = (maintainers, sharing);
+            &[
+                "--maintainer",
+                "--not-maintainer",
+                "--edit",
+                "--view",
+                "--unshare",
+                "--link",
+            ]
+        }
+        Command::Settings { public: p } => {
+            *p = public;
+            &["--public"]
         }
         _ => &[],
     };
@@ -245,7 +389,11 @@ pub fn run(admin: Admin) -> u8 {
                 print_document(&users, e);
             }
         }),
-        Command::Document { which, maintainers } => find(dir, &which).and_then(|e| {
+        Command::Document {
+            which,
+            maintainers,
+            sharing,
+        } => find(dir, &which).and_then(|mut e| {
             let users = if maintainers.is_empty() {
                 Users::read(dir)?
             } else {
@@ -257,9 +405,34 @@ pub fn run(admin: Admin) -> u8 {
                 })?
                 .0
             };
+            if !sharing.is_empty() {
+                // Checked here, so a mistake is said now; made by the host.
+                let mut check = e.meta.sharing.clone().unwrap_or(Sharing::new([0; 32]));
+                share(&mut check, &users, &sharing)?;
+                let change = SharingChange {
+                    document: e.id,
+                    what: sharing,
+                };
+                if ask_host(dir, &change)? {
+                    e = find(dir, &e.id.to_string())?;
+                } else {
+                    println!(
+                        "The host isn't running (or is busy): it makes the change when it starts."
+                    );
+                    return Ok(());
+                }
+            }
             print_document(&users, &e);
             Ok(())
         }),
+        Command::Settings { public } => {
+            let set = public.map_or(Ok(()), |on| crate::set_public(dir, on));
+            set.and_then(|_| crate::read_settings(dir)).map(|s| {
+                let on = if s.public { "on" } else { "off" };
+                println!("Settings of the host in {}", dir.display());
+                println!("    public room: {on} (--public on|off; a running host follows it)");
+            })
+        }
         Command::Backup { to } => backup(dir, &to).map(|n| {
             println!(
                 "Copied {n} documents, and the host's identity, settings and users, to {}.\n\
@@ -275,6 +448,31 @@ pub fn run(admin: Admin) -> u8 {
             1
         }
     }
+}
+
+/// Gives `change` to the host, and waits for it to be made: whether it was.
+fn ask_host(dir: &Path, change: &SharingChange) -> Result<bool, String> {
+    let changes = dir.join(CHANGES_DIR);
+    cadrs_fs::create_dir_all(&changes).map_err(|e| format!("{}: {e}", changes.display()))?;
+    // Named so the host makes them in the order they were asked.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = changes.join(format!("{nanos:024}-{}.ron", uuid::Uuid::new_v4()));
+    let text = ron::ser::to_string_pretty(change, ron::ser::PrettyConfig::default())
+        .map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("tmp");
+    cadrs_fs::write(&tmp, text)
+        .and_then(|_| cadrs_fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < WAIT_FOR_HOST {
+        if !cadrs_fs::exists(&path) {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(false)
 }
 
 /// The documents the host owns (not copies of others' documents), newest first.

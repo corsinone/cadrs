@@ -102,8 +102,12 @@ Usage:
   cadrs --host-documents [--data-dir <dir>]
       Lists a host's documents with their maintainers and whom they are shared with.
   cadrs --host-document <name or id> [--maintainer <user>]... [--not-maintainer <user>]...
-        [--data-dir <dir>]
-      Shows one of a host's documents, after making users its maintainers or no longer.
+        [--edit <user>]... [--view <user>]... [--unshare <user or cadrs ID>]...
+        [--link off|view|edit] [--data-dir <dir>]
+      Shows one of a host's documents, after making users its maintainers or no longer, or
+      changing whom it is shared with (which the host makes, as it would for a peer).
+  cadrs --host-settings [--public on|off] [--data-dir <dir>]
+      Shows a host's settings, after changing them; a running host follows them.
   cadrs --host-backup <folder> [--data-dir <dir>]
       Copies a host's data dir into a new folder, consistently even while it runs, and reads
       the copy back.
