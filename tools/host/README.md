@@ -41,6 +41,9 @@ change as it would one from the app's Share dialog, so everyone in the document 
 only its members get. `cadrs --help` lists every option (`--rename`, `--remove`,
 `--forget-id`...).
 
+The admin page shows the same in a browser, signed in with the team's accounts, behind a
+sign-in gateway: [`gateway/`](gateway/README.md) sets one up with LDAP.
+
 `docker stop cadrs-host` sends Ctrl+C (the image's `STOPSIGNAL`): the host saves every edit and
 history log before it stops.
 

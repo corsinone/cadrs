@@ -1,0 +1,28 @@
+# The sign-in gateway in front of the host's admin page: Caddy (HTTPS) asks Authelia whether
+# someone is signed in, and Authelia checks passwords against the team's LDAP. Both share the
+# machine's network with the host, so the host's page and Authelia listen on 127.0.0.1 only.
+# See README.md.
+services:
+  authelia:
+    image: authelia/authelia:4.39
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./authelia:/config
+      - ./secrets:/secrets:ro
+    environment:
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/jwt
+      AUTHELIA_SESSION_SECRET_FILE: /secrets/session
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/storage
+      AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE: /secrets/ldap
+
+  caddy:
+    image: caddy:2.10
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+
+volumes:
+  caddy-data:

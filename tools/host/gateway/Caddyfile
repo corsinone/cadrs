@@ -1,0 +1,27 @@
+# Two names on the team server machine (ask IT for them in the lab's DNS):
+# auth.lab.example.org, Authelia's sign-in page, and cadrs.lab.example.org, the host's admin
+# page. Replace both, here and in authelia/configuration.yml.
+#
+# `tls internal` makes the certificates with Caddy's own authority, which browsers don't know
+# until it is installed on them (README.md); with the lab's certificates instead, write
+# `tls /path/to/cert.pem /path/to/key.pem` and mount the files.
+
+auth.lab.example.org {
+	tls internal
+	reverse_proxy 127.0.0.1:9091
+}
+
+cadrs.lab.example.org {
+	tls internal
+	# Only Authelia names who signed in: whatever a browser sends in these headers is dropped.
+	request_header -Remote-User
+	request_header -Remote-Groups
+	request_header -Remote-Email
+	request_header -Remote-Name
+	forward_auth 127.0.0.1:9091 {
+		uri /api/authz/forward-auth
+		copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
+	}
+	# The host's admin page (cadrs --host-settings --page 127.0.0.1:8090).
+	reverse_proxy 127.0.0.1:8090
+}

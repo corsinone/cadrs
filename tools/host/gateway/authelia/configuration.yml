@@ -1,0 +1,66 @@
+# Authelia for the cadrs host's admin page, signing people in with the team's LDAP.
+# Fill in the LDAP section and the two names (README.md); the secrets come from ../secrets
+# (compose.yaml).
+
+server:
+  # Only Caddy, on the same machine, reaches it.
+  address: 'tcp://127.0.0.1:9091/'
+
+log:
+  level: 'info'
+
+authentication_backend:
+  # Passwords are changed where the team changes them, not here.
+  password_reset:
+    disable: true
+  ldap:
+    # The team's LDAP server: ldaps:// (or ldap:// with start_tls: true) keeps passwords
+    # encrypted on the way.
+    address: 'ldaps://ldap.lab.example.org'
+    # 'custom' fits OpenLDAP and most others; 'activedirectory' for Active Directory, whose
+    # usernames are sAMAccountName (attributes.username below).
+    implementation: 'custom'
+    timeout: '5s'
+    base_dn: 'dc=lab,dc=example,dc=org'
+    additional_users_dn: 'ou=people'
+    users_filter: '(&({username_attribute}={input})(objectClass=person))'
+    additional_groups_dn: 'ou=groups'
+    groups_filter: '(&(member={dn})(objectClass=groupOfNames))'
+    # An account that may search the directory (ask IT for one); its password is in
+    # ../secrets/ldap.
+    user: 'uid=cadrs-gateway,ou=services,dc=lab,dc=example,dc=org'
+    attributes:
+      # What the admin page gets as the sign-in, to match the users' --sign-in.
+      username: 'uid'
+      display_name: 'displayName'
+      mail: 'mail'
+      group_name: 'cn'
+
+access_control:
+  default_policy: 'deny'
+  rules:
+    # Anyone in the LDAP may sign in; the host decides what they may do (its users' roles).
+    # To let in only a group: add `subject: 'group:cadrs-admins'`.
+    - domain: 'cadrs.lab.example.org'
+      policy: 'one_factor'
+
+session:
+  cookies:
+    - domain: 'lab.example.org'
+      authelia_url: 'https://auth.lab.example.org'
+      default_redirection_url: 'https://cadrs.lab.example.org'
+
+# Brute force: 5 wrong passwords in 2 minutes lock that username for 10 minutes.
+regulation:
+  max_retries: 5
+  find_time: '2m'
+  ban_time: '10m'
+
+storage:
+  local:
+    path: '/config/db.sqlite3'
+
+# With password reset off, nothing needs sending; Authelia still wants a notifier.
+notifier:
+  filesystem:
+    filename: '/config/notifications.txt'
