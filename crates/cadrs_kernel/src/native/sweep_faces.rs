@@ -233,6 +233,9 @@ pub(crate) fn face_points(b: &Body, fi: usize, _size: f64) -> Vec<(P3, V3)> {
             (ax + dx * t - qx).hypot(ay + dy * t - qy) < NEAR
         })
     };
+    // (The outline's polygons boxed, and long ones in rows: a point is weighed against the
+    // sides near it only.)
+    let boxed = super::classify::FacePolys::new(&polys, &f.surf);
     // (Row by row, side by side where the outline is long: each point is weighed against
     // every piece of it.)
     let row = |i: usize| -> Vec<P2> {
@@ -244,7 +247,7 @@ pub(crate) fn face_points(b: &Body, fi: usize, _size: f64) -> Vec<(P3, V3)> {
                 )
             })
             .filter(|&q| {
-                super::classify::in_face(&polys, &f.surf, q, tol) == super::classify::InFace::Inside
+                boxed.in_face(&f.surf, q, tol) == super::classify::InFace::Inside
                     && !near_outline(q)
             })
             .collect()
@@ -1745,6 +1748,13 @@ pub(super) fn glued_with(
         // mesh, as a ray through the long helical B-spline faces a screw sweeps can miss a
         // crossing. Each kept face on its own: the faces are many and the rays dear.)
         let boxes: Vec<Bbox> = all.iter().map(|b| b.bbox()).collect();
+        // (Each body's classifier made once, at the first point asked of it: its faces'
+        // polygons boxed, for every point of every kept face.)
+        let classifiers: Vec<std::sync::OnceLock<super::classify::Classifier>> =
+            all.iter().map(|_| std::sync::OnceLock::new()).collect();
+        let classifier = |bj: usize| {
+            classifiers[bj].get_or_init(|| super::classify::Classifier::new(&all[bj], &polys[bj]))
+        };
         let eps = 1e-3 * size.max(1.0);
         let kept: Vec<(usize, usize)> = faces
             .iter()
@@ -1765,11 +1775,8 @@ pub(super) fn glued_with(
                     .take(4)
                 {
                     let out = f.surf.eval(q.x, q.y) + f.surf.normal(q.x, q.y) * (sign * eps);
-                    for bj in 0..all.len() {
-                        if bj != bi
-                            && boxes[bj].contains(&out)
-                            && super::classify::parity_inside(&all[bj], &polys[bj], &out)
-                        {
+                    for (bj, bx) in boxes.iter().enumerate() {
+                        if bj != bi && bx.contains(&out) && classifier(bj).parity_inside(&out) {
                             found.push((bi, fi, bj, out));
                         }
                     }

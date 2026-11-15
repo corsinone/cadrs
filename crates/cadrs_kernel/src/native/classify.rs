@@ -15,30 +15,30 @@ pub enum InFace {
 
 /// A face's loops sampled as uv polygons (for in-face tests).
 pub fn face_polygons(body: &Body, f: &Face) -> Vec<Vec<P2>> {
-    f.loops
-        .iter()
-        .map(|l| {
-            let mut pts = Vec::new();
-            for c in l {
-                let e = &body.edges[c.edge];
-                let (a, b) = co_range(e, c.fwd);
-                let n = match &c.pc {
-                    super::curve::Curve::Line { .. } => 1,
-                    _ => {
-                        // Enough points that the polygon is within ~1e-6 of the p-curve.
-                        let span = (b - a).abs();
-                        ((span * 256.0).ceil() as usize).clamp(16, 4096)
-                    }
-                };
-                for i in 0..n {
-                    let t = a + (b - a) * i as f64 / n as f64;
-                    let p = c.pc.point(t);
-                    pts.push(P2::new(p.x, p.y));
-                }
+    f.loops.iter().map(|l| loop_polygon(body, l)).collect()
+}
+
+/// One of a face's loops sampled as a uv polygon ([`face_polygons`]).
+fn loop_polygon(body: &Body, l: &[super::topo::Coedge]) -> Vec<P2> {
+    let mut pts = Vec::new();
+    for c in l {
+        let e = &body.edges[c.edge];
+        let (a, b) = co_range(e, c.fwd);
+        let n = match &c.pc {
+            super::curve::Curve::Line { .. } => 1,
+            _ => {
+                // Enough points that the polygon is within ~1e-6 of the p-curve.
+                let span = (b - a).abs();
+                ((span * 256.0).ceil() as usize).clamp(16, 4096)
             }
-            pts
-        })
-        .collect()
+        };
+        for i in 0..n {
+            let t = a + (b - a) * i as f64 / n as f64;
+            let p = c.pc.point(t);
+            pts.push(P2::new(p.x, p.y));
+        }
+    }
+    pts
 }
 
 /// A face's [`face_polygons`] and their [`poly_boxes`].
@@ -46,54 +46,110 @@ pub type KeptPolygons = std::sync::Arc<(Vec<Vec<P2>>, PolyBoxes)>;
 
 /// [`face_polygons`] and their [`poly_boxes`], kept by what they are made from (the face's
 /// surface and each p-curve over its range): a boolean takes every face of both its bodies (in
-/// its import and again to classify), most of them as the bodies before it had them.
+/// its import and again to classify), most of them as the bodies before it had them. Each loop
+/// is kept too, so a face that gained a loop since (a plate's face, a hole cut in it one after
+/// another) samples only the new one.
 pub fn face_polygons_kept(body: &Body, f: &Face) -> KeptPolygons {
     use std::hash::Hasher;
     /// Two generations of at most this many points each (16 bytes a point, and the boxes).
     const KEPT: usize = 1 << 21;
+    type KeptLoop = std::sync::Arc<(Vec<P2>, PolyBox)>;
     #[derive(Default)]
     struct Kept {
         new: rustc_hash::FxHashMap<u128, KeptPolygons>,
+        new_loops: rustc_hash::FxHashMap<u128, KeptLoop>,
         new_points: usize,
         old: rustc_hash::FxHashMap<u128, KeptPolygons>,
+        old_loops: rustc_hash::FxHashMap<u128, KeptLoop>,
+    }
+    impl Kept {
+        /// Counts `points` more kept, starting a new generation first when they don't fit.
+        fn room(&mut self, points: usize) {
+            if self.new_points + points > KEPT {
+                self.old = std::mem::take(&mut self.new);
+                self.old_loops = std::mem::take(&mut self.new_loops);
+                self.new_points = 0;
+            }
+            self.new_points += points;
+        }
     }
     static KEPT_POLYS: std::sync::LazyLock<std::sync::Mutex<Kept>> =
         std::sync::LazyLock::new(Default::default);
-    let mut h = super::fingerprint::Key128::new();
-    h.surface(&f.surf);
-    for l in &f.loops {
-        h.write_usize(l.len());
-        for c in l {
-            let (a, b) = co_range(&body.edges[c.edge], c.fwd);
-            h.f64s(&[a, b]);
-            h.curve(&c.pc);
+    // Each loop's key (the surface and the loop's p-curves over their ranges), and the face's
+    // (the loops' in order).
+    let loop_keys: Vec<u128> = f
+        .loops
+        .iter()
+        .map(|l| {
+            let mut h = super::fingerprint::Key128::new();
+            h.surface(&f.surf);
+            h.write_usize(l.len());
+            for c in l {
+                let (a, b) = co_range(&body.edges[c.edge], c.fwd);
+                h.f64s(&[a, b]);
+                h.curve(&c.pc);
+            }
+            h.key()
+        })
+        .collect();
+    let key = {
+        let mut h = super::fingerprint::Key128::new();
+        h.write_usize(loop_keys.len());
+        for k in &loop_keys {
+            h.write_u128(*k);
+        }
+        h.key()
+    };
+    let points = |p: &KeptPolygons| p.0.iter().map(Vec::len).sum::<usize>() + 1;
+    let mut k = KEPT_POLYS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = k.new.get(&key).cloned() {
+        return p;
+    }
+    if let Some(p) = k.old.remove(&key) {
+        k.room(points(&p));
+        k.new.insert(key, p.clone());
+        return p;
+    }
+    // The face's loops, each kept or sampled now (the lock let go meanwhile: sampling a long
+    // loop takes a while).
+    let mut kept: Vec<Option<KeptLoop>> = loop_keys
+        .iter()
+        .map(|lk| {
+            k.new_loops.get(lk).cloned().or_else(|| {
+                let p = k.old_loops.remove(lk)?;
+                k.room(p.0.len() + 1);
+                k.new_loops.insert(*lk, p.clone());
+                Some(p)
+            })
+        })
+        .collect();
+    drop(k);
+    let mut made: Vec<(u128, KeptLoop)> = Vec::new();
+    for (i, slot) in kept.iter_mut().enumerate() {
+        if slot.is_none() {
+            let poly = loop_polygon(body, &f.loops[i]);
+            let pb = poly_boxes(std::slice::from_ref(&poly), &f.surf)
+                .pop()
+                .expect("a box per polygon");
+            let l: KeptLoop = std::sync::Arc::new((poly, pb));
+            made.push((loop_keys[i], l.clone()));
+            *slot = Some(l);
         }
     }
-    let key = h.key();
-    let points = |p: &KeptPolygons| p.0.iter().map(Vec::len).sum::<usize>() + 1;
-    let kept = {
-        let mut k = KEPT_POLYS.lock().unwrap_or_else(|e| e.into_inner());
-        match k.new.get(&key).cloned() {
-            Some(p) => Some(p),
-            None => k.old.remove(&key).inspect(|p| {
-                k.new_points += points(p);
-                k.new.insert(key, p.clone());
-            }),
-        }
-    };
-    kept.unwrap_or_else(|| {
-        let polys = face_polygons(body, f);
-        let boxes = poly_boxes(&polys, &f.surf);
-        let p: KeptPolygons = std::sync::Arc::new((polys, boxes));
-        let mut k = KEPT_POLYS.lock().unwrap_or_else(|e| e.into_inner());
-        if k.new_points + points(&p) > KEPT {
-            k.old = std::mem::take(&mut k.new);
-            k.new_points = 0;
-        }
-        k.new_points += points(&p);
-        k.new.insert(key, p.clone());
-        p
-    })
+    let (polys, boxes): (Vec<Vec<P2>>, PolyBoxes) = kept
+        .into_iter()
+        .flatten()
+        .map(|l| (l.0.clone(), l.1.clone()))
+        .unzip();
+    let p: KeptPolygons = std::sync::Arc::new((polys, boxes));
+    let mut k = KEPT_POLYS.lock().unwrap_or_else(|e| e.into_inner());
+    for (lk, l) in made {
+        k.room(l.0.len() + 1);
+        k.new_loops.insert(lk, l);
+    }
+    k.room(points(&p));
+    k.new.insert(key, p.clone());
+    p
 }
 
 /// Point in a face's domain given its sampled loops; `tol` in model units (scaled by the
@@ -164,6 +220,13 @@ impl Rows {
         let n = (self.start.len() - 1) as f64;
         let at = |y: f64| ((y - self.y0) / self.dy).floor().clamp(0.0, n - 1.0) as usize;
         at(y0)..=at(y1)
+    }
+}
+
+impl PolyBox {
+    /// The polygon's (u, v) box: (min u, max u, min v, max v).
+    pub fn uv_box(&self) -> [f64; 4] {
+        self.b
     }
 }
 
@@ -338,6 +401,19 @@ impl<'a> FacePolys<'a> {
 /// Parameters t where the line o + t·d meets the surface (all of them, any sign), with the
 /// (u, v) there.
 pub fn ray_surface(s: &Surface, o: &P3, d: &V3, tmin: f64, tmax: f64) -> Vec<(f64, f64, f64)> {
+    ray_surface_with(s, o, d, tmin, tmax, None)
+}
+
+/// [`ray_surface`], with a parametric surface's grid of points ([`RayGrid`]) kept in `grid`
+/// for the next ray at the same surface, where given.
+fn ray_surface_with(
+    s: &Surface,
+    o: &P3,
+    d: &V3,
+    tmin: f64,
+    tmax: f64,
+    grid: Option<&std::sync::OnceLock<RayGrid>>,
+) -> Vec<(f64, f64, f64)> {
     let mut ts: Vec<f64> = Vec::new();
     match s {
         Surface::Plane { f } => {
@@ -380,6 +456,7 @@ pub fn ray_surface(s: &Surface, o: &P3, d: &V3, tmin: f64, tmax: f64) -> Vec<(f6
                 }
             }
         }
+        Surface::Torus { f, rmaj, rmin } => ts = ray_torus(s, f, *rmaj, *rmin, o, d, tmin, tmax),
         Surface::Extrusion { c, d: dir } => {
             // The plane through the ray parallel to the extrusion cuts it in rulings where the
             // base curve crosses that plane; each ruling meets the ray at one point.
@@ -402,51 +479,18 @@ pub fn ray_surface(s: &Surface, o: &P3, d: &V3, tmin: f64, tmax: f64) -> Vec<(f6
             }
         }
         Surface::Nurbs(_) | Surface::Revolution { .. } => {
-            return ray_parametric(s, o, d);
-        }
-        _ => {
-            // Implicit along the ray where available, else sampled distance with projection.
-            let n = 400;
-            let f = |t: f64| -> f64 {
-                let p = o + d * t;
-                match s.signed_distance(&p) {
-                    Some(x) => x,
-                    None => {
-                        let (u, v) = s.project(&p, None);
-                        let (q, su, sv) = s.d1(u, v);
-                        (p - q).dot(&su.cross(&sv).normalize())
-                    }
-                }
-            };
-            let (lo, hi) = (tmin, tmax);
-            let mut prev = (lo, f(lo));
-            for i in 1..=n {
-                let t = lo + (hi - lo) * i as f64 / n as f64;
-                let ft = f(t);
-                if prev.1 == 0.0 {
-                    ts.push(prev.0);
-                } else if prev.1.signum() != ft.signum() {
-                    // Bisect.
-                    let (mut a, mut b, mut fa) = (prev.0, t, prev.1);
-                    for _ in 0..80 {
-                        let m = 0.5 * (a + b);
-                        let fm = f(m);
-                        if fm.signum() == fa.signum() {
-                            a = m;
-                            fa = fm;
-                        } else {
-                            b = m;
-                        }
-                    }
-                    let m = 0.5 * (a + b);
-                    // Reject sign flips across the far side of a projection jump.
-                    let p = o + d * m;
-                    if s.distance(&p) < tol::POINT {
-                        ts.push(m);
-                    }
-                }
-                prev = (t, ft);
+            if let Surface::Revolution {
+                f,
+                m: super::curve::Curve::Line { o: lo, d: ld },
+            } = s
+                && let Some(hits) = ray_revolved_line(f, lo, ld, o, d)
+            {
+                return hits;
             }
+            return match grid {
+                Some(g) => ray_parametric(s, g.get_or_init(|| RayGrid::new(s)), o, d),
+                None => ray_parametric(s, &RayGrid::new(s), o, d),
+            };
         }
     }
     let mut out = Vec::new();
@@ -455,31 +499,174 @@ pub fn ray_surface(s: &Surface, o: &P3, d: &V3, tmin: f64, tmax: f64) -> Vec<(f6
         let (u, v) = s.project(&p, None);
         out.push((t, u, v));
     }
-    // Torus: the quadric cases above miss it; handled by the sampled branch.
     out
 }
 
-/// Line–surface hits on a parametric surface: the ray against a triangulated grid of the
-/// surface's parameter box, each hit refined by Newton on S(u, v) = o + t·d.
-fn ray_parametric(s: &Surface, o: &P3, d: &V3) -> Vec<(f64, f64, f64)> {
-    let ((u0, u1), (v0, v1)) = match s {
-        Surface::Revolution { m, .. } => ((0.0, TAU), m.nurbs_range().unwrap_or((-1e3, 1e3))),
-        _ => s.param_box(),
-    };
-    let n = 32;
-    let at = |i: usize, j: usize| {
+/// Parameters t in [tmin, tmax] where the line o + t·d meets the torus of `s` (frame `f`,
+/// radii `rmaj` and `rmin`): the roots of the quartic (|p|² + R² − r²)² = 4R²(x² + y²) along
+/// it (in the torus's frame, from the line's point nearest its centre), each then settled by
+/// Newton on the torus's own distance, and kept where the point lies on it.
+#[allow(clippy::too_many_arguments)]
+fn ray_torus(
+    s: &Surface,
+    f: &Frame,
+    rmaj: f64,
+    rmin: f64,
+    o: &P3,
+    d: &V3,
+    tmin: f64,
+    tmax: f64,
+) -> Vec<f64> {
+    let e = V3::new(d.dot(&f.x), d.dot(&f.y), d.dot(&f.z));
+    let a = e.norm_squared();
+    if !(a > 0.0) {
+        return Vec::new();
+    }
+    let q0 = f.local(o);
+    let t0 = -q0.dot(&e) / a;
+    let q = q0 + e * t0;
+    let (b, c) = (
+        2.0 * q.dot(&e),
+        q.norm_squared() + rmaj * rmaj - rmin * rmin,
+    );
+    let (pa, pb, pc) = (
+        e.x * e.x + e.y * e.y,
+        2.0 * (q.x * e.x + q.y * e.y),
+        q.x * q.x + q.y * q.y,
+    );
+    let r4 = 4.0 * rmaj * rmaj;
+    let coeffs = [
+        c * c - r4 * pc,
+        2.0 * b * c - r4 * pb,
+        b * b + 2.0 * a * c - r4 * pa,
+        2.0 * a * b,
+        a * a,
+    ];
+    let dist = |t: f64| s.signed_distance(&(o + d * t));
+    let mut ts = Vec::new();
+    for x in poly_roots(&coeffs, tmin - t0, tmax - t0) {
+        let mut t = x + t0;
+        // (The quartic's root holds only to the square root of its rounding where the line
+        // nearly grazes the torus: a few Newton steps on the distance, taken while they help.)
+        if let Some(mut g) = dist(t) {
+            let h = 1e-7 * (1.0 + t.abs());
+            for _ in 0..3 {
+                let (Some(g1), Some(g0)) = (dist(t + h), dist(t - h)) else {
+                    break;
+                };
+                let slope = (g1 - g0) / (2.0 * h);
+                if !(slope.abs() > 1e-6) {
+                    break;
+                }
+                let nt = t - g / slope;
+                match dist(nt) {
+                    Some(ng) if ng.abs() < g.abs() => (t, g) = (nt, ng),
+                    _ => break,
+                }
+            }
+        }
+        if s.distance(&(o + d * t)) < tol::POINT {
+            ts.push(t);
+        }
+    }
+    ts
+}
+
+/// Line–surface hits on the surface a line `lo + v·ld` sweeps turning about the z axis of `f` (a
+/// cylinder, a cone or a hyperboloid of one sheet: a quadric), as (t, u, v) with u in [0, 2π).
+/// None where the line runs nearly square to the axis (a flat ring, which the turn covers twice:
+/// v is then not the height's), for [`ray_parametric`].
+///
+/// A point at height z on the surface is as far from the axis as the line's point at that height,
+/// v = (z − a_z) / b_z (the line a + v·b in the frame), so the surface is ρ² = (a_x + v b_x)² +
+/// (a_y + v b_y)², quadratic in z, and along the ray quadratic in t.
+fn ray_revolved_line(f: &Frame, lo: &P3, ld: &V3, o: &P3, d: &V3) -> Option<Vec<(f64, f64, f64)>> {
+    let (a, b) = (
+        f.local(lo),
+        V3::new(ld.dot(&f.x), ld.dot(&f.y), ld.dot(&f.z)),
+    );
+    if b.z.abs() < 1e-3 * b.norm() {
+        return None;
+    }
+    let (q, e) = (f.local(o), V3::new(d.dot(&f.x), d.dot(&f.y), d.dot(&f.z)));
+    // The line's point at the ray's height, g0 + t·g1 in x and y.
+    let v0 = (q.z - a.z) / b.z;
+    let v1 = e.z / b.z;
+    let (gx0, gx1) = (a.x + v0 * b.x, v1 * b.x);
+    let (gy0, gy1) = (a.y + v0 * b.y, v1 * b.y);
+    let roots = quadratic(
+        e.x * e.x + e.y * e.y - gx1 * gx1 - gy1 * gy1,
+        2.0 * (q.x * e.x + q.y * e.y - gx0 * gx1 - gy0 * gy1),
+        q.x * q.x + q.y * q.y - gx0 * gx0 - gy0 * gy0,
+    );
+    let mut out: Vec<(f64, f64, f64)> = Vec::with_capacity(2);
+    for t in roots {
+        if out.iter().any(|(x, ..)| (x - t).abs() < tol::ROUNDOFF) {
+            continue;
+        }
+        let v = v0 + t * v1;
+        let (px, py) = (q.x + t * e.x, q.y + t * e.y);
+        let (mx, my) = (a.x + v * b.x, a.y + v * b.y);
+        // The turn from the line's point to the ray's (any, on the axis).
+        let u = (py.atan2(px) - my.atan2(mx)).rem_euclid(TAU);
+        out.push((t, if u < TAU { u } else { 0.0 }, v));
+    }
+    Some(out)
+}
+
+/// A parametric surface's points over a grid of its parameter box, for rays against it
+/// ([`ray_parametric`]): the same for every ray, so made once for the many a classifier casts.
+struct RayGrid {
+    u: (f64, f64),
+    v: (f64, f64),
+    n: usize,
+    pts: Vec<P3>,
+}
+
+impl RayGrid {
+    fn new(s: &Surface) -> Self {
+        let (u, v) = match s {
+            Surface::Revolution { m, .. } => ((0.0, TAU), m.nurbs_range().unwrap_or((-1e3, 1e3))),
+            _ => s.param_box(),
+        };
+        let mut g = RayGrid {
+            u,
+            v,
+            n: 32,
+            pts: Vec::new(),
+        };
+        let pts = surface_grid(s, g.n, |i, j| g.at(i, j));
+        g.pts = pts;
+        g
+    }
+
+    /// The (u, v) of the grid's point (i, j).
+    fn at(&self, i: usize, j: usize) -> (f64, f64) {
+        let ((u0, u1), (v0, v1), n) = (self.u, self.v, self.n);
         (
             u0 + (u1 - u0) * i as f64 / n as f64,
             v0 + (v1 - v0) * j as f64 / n as f64,
         )
-    };
-    let mut grid = vec![P3::origin(); (n + 1) * (n + 1)];
-    for i in 0..=n {
-        for j in 0..=n {
-            let (u, v) = at(i, j);
-            grid[i * (n + 1) + j] = s.eval(u, v);
-        }
     }
+}
+
+/// Line–surface hits on a parametric surface: the ray against a triangulated grid of the
+/// surface's parameter box (`g`, of `s`), each hit refined by Newton on S(u, v) = o + t·d.
+fn ray_parametric(s: &Surface, g: &RayGrid, o: &P3, d: &V3) -> Vec<(f64, f64, f64)> {
+    let (n, grid) = (g.n, &g.pts);
+    let at = |i: usize, j: usize| g.at(i, j);
+    // The grid seen along the ray: each point's place in the plane square to it, about the ray.
+    // A triangle the ray goes through (within the margin below) has the ray's point in its
+    // shadow there, so only cells whose shadow's box (grown for the margin) holds it are tried.
+    let e1 = any_perpendicular(d).normalize();
+    let e2 = d.cross(&e1).normalize();
+    let shadow: Vec<[f64; 2]> = grid
+        .iter()
+        .map(|q| {
+            let w = q - o;
+            [w.dot(&e1), w.dot(&e2)]
+        })
+        .collect();
     let mut out: Vec<(f64, f64, f64)> = Vec::new();
     let tri = |a: &P3, b: &P3, c: &P3| -> Option<(f64, f64, f64)> {
         // Möller–Trumbore with a small margin; returns (t, β, γ).
@@ -502,6 +689,25 @@ fn ray_parametric(s: &Surface, o: &P3, d: &V3) -> Vec<(f64, f64, f64)> {
     };
     for i in 0..n {
         for j in 0..n {
+            let corners = [
+                i * (n + 1) + j,
+                (i + 1) * (n + 1) + j,
+                i * (n + 1) + j + 1,
+                (i + 1) * (n + 1) + j + 1,
+            ];
+            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            for &k in &corners {
+                for a in 0..2 {
+                    lo[a] = lo[a].min(shadow[k][a]);
+                    hi[a] = hi[a].max(shadow[k][a]);
+                }
+            }
+            // (Barycentric margins of m reach at most 3m of the triangle's edges past it; the
+            // cell's box, its width and height, bounds them, and doubling that covers rounding.)
+            let grow = 0.3 * ((hi[0] - lo[0]) + (hi[1] - lo[1])) + tol::ROUNDOFF;
+            if lo[0] > grow || hi[0] < -grow || lo[1] > grow || hi[1] < -grow {
+                continue;
+            }
             let (p00, p10, p01, p11) = (
                 grid[i * (n + 1) + j],
                 grid[(i + 1) * (n + 1) + j],
@@ -547,6 +753,31 @@ fn ray_parametric(s: &Surface, o: &P3, d: &V3) -> Vec<(f64, f64, f64)> {
         }
     }
     out
+}
+
+/// The surface's points at `at(i, j)` for i, j in 0..=n, row by row of i. A surface of revolution
+/// is evaluated as [`Surface::eval`] does, to the bit, but with its meridian's points and the
+/// turns' sines found once per row and column rather than once per point.
+fn surface_grid(s: &Surface, n: usize, at: impl Fn(usize, usize) -> (f64, f64)) -> Vec<P3> {
+    let mut grid = Vec::with_capacity((n + 1) * (n + 1));
+    if let Surface::Revolution { f, m } = s {
+        let ls: Vec<V3> = (0..=n).map(|j| f.local(&m.point(at(0, j).1))).collect();
+        for i in 0..=n {
+            let (s, c) = at(i, 0).0.sin_cos();
+            grid.extend(
+                ls.iter()
+                    .map(|l| f.world_point(&V3::new(l.x * c - l.y * s, l.x * s + l.y * c, l.z))),
+            );
+        }
+    } else {
+        for i in 0..=n {
+            grid.extend((0..=n).map(|j| {
+                let (u, v) = at(i, j);
+                s.eval(u, v)
+            }));
+        }
+    }
+    grid
 }
 
 /// Rays cast (parity votes and [`ray_hits`]), and points classified, since the start: the counts
@@ -757,6 +988,8 @@ pub struct Classifier<'a> {
     boxes: Vec<Bbox>,
     bbox: Bbox,
     starts: Vec<Option<(f64, f64)>>,
+    /// Each parametric face's grid for rays, made at the first ray that reaches the face.
+    grids: Vec<std::sync::OnceLock<RayGrid>>,
 }
 
 impl<'a> Classifier<'a> {
@@ -807,6 +1040,7 @@ impl<'a> Classifier<'a> {
             boxes,
             bbox,
             starts,
+            grids: (0..body.faces.len()).map(|_| Default::default()).collect(),
         }
     }
 
@@ -884,7 +1118,8 @@ impl<'a> Classifier<'a> {
                 if !ray_meets_box(p, &d, &self.boxes[fi].grow(tol::REL * (1.0 + span))) {
                     continue;
                 }
-                for (t, u, v) in ray_surface(&f.surf, p, &d, -span, span) {
+                let grid = Some(&self.grids[fi]);
+                for (t, u, v) in ray_surface_with(&f.surf, p, &d, -span, span, grid) {
                     if t <= tol::ROUNDOFF_FINE {
                         continue;
                     }
@@ -1124,5 +1359,104 @@ mod boxed_tests {
                 );
             }
         }
+    }
+
+    /// The torus's crossings along a line are where its distance changes sign along it,
+    /// found by sampling finely; each lies on the torus.
+    #[test]
+    fn torus_hits_match_sampling() {
+        let f = Frame::from_xz(
+            P3::new(0.5, -1.0, 2.0),
+            V3::new(1.0, 0.3, 0.2),
+            V3::new(-0.2, 0.4, 1.0),
+        );
+        let s = Surface::Torus {
+            f,
+            rmaj: 6.0,
+            rmin: 2.0,
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        let mut hits = 0;
+        for _ in 0..300 {
+            let o = f.o + V3::new(10.0 * rnd(), 10.0 * rnd(), 4.0 * rnd());
+            let d = V3::new(rnd(), rnd(), 0.4 * rnd()).normalize();
+            let ts: Vec<f64> = ray_surface(&s, &o, &d, -30.0, 30.0)
+                .into_iter()
+                .map(|h| h.0)
+                .collect();
+            let n = 60_000;
+            let g = |t: f64| s.signed_distance(&(o + d * t)).unwrap();
+            let mut flips = Vec::new();
+            for i in 0..n {
+                let (a, b) = (
+                    -30.0 + 60.0 * i as f64 / n as f64,
+                    -30.0 + 60.0 * (i + 1) as f64 / n as f64,
+                );
+                if g(a).signum() != g(b).signum() {
+                    flips.push(0.5 * (a + b));
+                }
+            }
+            assert_eq!(ts.len(), flips.len(), "{ts:?} {flips:?}");
+            for (t, x) in ts.iter().zip(&flips) {
+                assert!((t - x).abs() < 1e-3, "{ts:?} {flips:?}");
+                assert!(g(*t).abs() < 1e-9, "{t}: {}", g(*t));
+            }
+            hits += ts.len();
+        }
+        assert!(hits > 200, "{hits}");
+    }
+
+    /// The closed form for a turned line finds the points the grid search does, and each (t, u,
+    /// v) it gives is the surface's point on the ray: on a hyperboloid (the line skew to the
+    /// axis), a cone (through it) and a cylinder (beside it), in a tilted frame.
+    #[test]
+    fn turned_line_hits_match_the_grid_search() {
+        let f = Frame::from_xz(
+            P3::new(0.3, -0.2, 0.7),
+            V3::new(1.0, 0.2, -0.1),
+            V3::new(0.2, 0.3, 1.0),
+        );
+        let lines = [
+            (P3::new(1.0, 0.5, 0.2), V3::new(0.3, -0.8, 0.6)),
+            (P3::new(0.9, 0.0, 0.6), V3::new(-0.5, 0.4, -1.2)),
+            (P3::new(1.5, -0.7, 0.0), f.z * 2.0),
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        let mut found = 0;
+        for (lo, ld) in lines {
+            let s = Surface::Revolution {
+                f,
+                m: super::super::curve::Curve::Line { o: lo, d: ld },
+            };
+            for _ in 0..200 {
+                let o = P3::new(3.0 * rnd(), 3.0 * rnd(), 3.0 * rnd());
+                let d = V3::new(rnd(), rnd(), rnd()).normalize();
+                let exact = ray_revolved_line(&f, &lo, &ld, &o, &d).expect("not a flat ring");
+                for &(t, u, v) in &exact {
+                    assert!((0.0..TAU).contains(&u));
+                    assert!((s.eval(u, v) - (o + d * t)).norm() < 1e-9, "{t} {u} {v}");
+                }
+                for (t, ..) in ray_parametric(&s, &RayGrid::new(&s), &o, &d) {
+                    found += 1;
+                    assert!(
+                        exact.iter().any(|(x, ..)| (x - t).abs() < 1e-7),
+                        "{t} not in {exact:?}"
+                    );
+                }
+            }
+        }
+        assert!(found > 300, "{found}");
     }
 }

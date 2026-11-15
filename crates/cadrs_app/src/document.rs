@@ -828,7 +828,7 @@ fn view_tools(bar: &mut ChildSpawnerCommands, t: &Theme) {
         for (name, icon_name, tip) in [
             ("view-section", "section-view", "shell-doc-section-view"),
             ("view-measure", "measure", "shell-doc-measure"),
-            // P3E.3b: the Analysis tools (icon-rs has no analysis icon: the curvature glyph
+            // P3E.3b: the Analysis tools (cadrs_icons has no analysis icon: the curvature glyph
             // stands in).
             (
                 "view-analysis",
@@ -836,7 +836,7 @@ fn view_tools(bar: &mut ChildSpawnerCommands, t: &Theme) {
                 "shell-doc-analysis-tools",
             ),
             ("view-mass", "mass-properties", "shell-doc-mass-properties"),
-            // P3F.5: the Simulation panel (`crate::simulation_ui`; icon-rs has no simulation
+            // P3F.5: the Simulation panel (`crate::simulation_ui`; cadrs_icons has no simulation
             // icon: Thicken's deformed sheet stands in).
             ("panel-simulation", "thicken", "shell-doc-simulation"),
             // P3I.3: shown once a sheet metal model exists (`crate::sheetmetal_table`).
@@ -1656,6 +1656,7 @@ fn part_studio_toolbar(tb: &mut ChildSpawnerCommands, t: &Theme) {
             ("shell", "shell", false, "shell-tool-shell"),
             ("hole", "hole", false, "shell-tool-hole"),
             ("thread", "thread", false, "shell-tool-thread"),
+            ("gear", "gear", false, "shell-tool-gear"),
             ("move-face", "offset", true, "shell-tool-direct-edit"),
         ],
         &[
@@ -1997,7 +1998,7 @@ fn part_studio_toolbar(tb: &mut ChildSpawnerCommands, t: &Theme) {
     search_tools(tb, t);
 }
 
-/// The Thicken button's menu: Thicken, Fill and Helix (icon-rs has no fill or helix icon yet).
+/// The Thicken button's menu: Thicken, Fill and Helix (cadrs_icons has no fill or helix icon yet).
 fn surfacing_menu() -> Menu {
     Menu::new("surfacing-menu")
         .min_width(160.0)
@@ -2006,7 +2007,7 @@ fn surfacing_menu() -> Menu {
         .item(MenuItem::new("surfacing-menu-helix", tr("shell-tool-helix")).icon("thread"))
 }
 
-/// The Move face button's menu: the direct edits (icon-rs has no move face, delete face or
+/// The Move face button's menu: the direct edits (cadrs_icons has no move face, delete face or
 /// simplify icon yet: offset, delete and surface stand in).
 fn direct_edit_menu() -> Menu {
     Menu::new("direct-edit-menu")
@@ -3686,6 +3687,7 @@ enum RowKind {
     Thicken,
     Helix,
     Thread,
+    Gear,
     Fill,
     /// Move face, Delete face, Simplify (their icon).
     DirectEdit(&'static str),
@@ -3731,9 +3733,10 @@ impl RowKind {
             RowKind::Import => "file-import",
             RowKind::Image => "image",
             RowKind::Thicken => "thicken",
-            // icon-rs has no helix or fill icon yet (recorded in PROGRESS.md).
+            // cadrs_icons has no helix or fill icon yet (recorded in PROGRESS.md).
             RowKind::Helix => "thread",
             RowKind::Thread => "thread",
+            RowKind::Gear => "gear",
             RowKind::Fill => "surface",
             RowKind::Variable => "variables",
             RowKind::SheetMetalModel => "sheet-metal-model",
@@ -3897,6 +3900,7 @@ fn rebuild_feature_rows(
                     | cadrs_core::FeatureKind::ProjectCurve(_) => RowKind::Helix,
                     cadrs_core::FeatureKind::FaceBlend(_) => RowKind::Fillet,
                     cadrs_core::FeatureKind::Thread(_) => RowKind::Thread,
+                    cadrs_core::FeatureKind::Gear(_) => RowKind::Gear,
                     cadrs_core::FeatureKind::Fill(_) => RowKind::Fill,
                     cadrs_core::FeatureKind::Variable(_) => RowKind::Variable,
                     cadrs_core::FeatureKind::SheetMetalModel(_) => RowKind::SheetMetalModel,
@@ -4627,7 +4631,16 @@ fn on_feature_double_click(
 ) {
     if let Ok(row) = q.get(ev.entity) {
         let id = row.0;
-        commands.queue(move |world: &mut World| edit_feature(world, id));
+        commands.queue(move |world: &mut World| {
+            edit_feature(world, id);
+            // A sketch opened this way is looked at square on, all of it in view.
+            if world
+                .get_resource::<crate::sketch::SketchSession>()
+                .is_some_and(|s| s.feature == id && !s.waiting_for_plane)
+            {
+                crate::viewport::frame_sketch(world, id);
+            }
+        });
     }
 }
 

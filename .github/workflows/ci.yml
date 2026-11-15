@@ -116,6 +116,10 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # The committed icons (crates/cadrs_icons) match their drawing functions in cadrs_icons_gen.
+      - name: Icons up to date
+        run: cargo run -q -p cadrs_icons_gen -- --check
+
       # Unit tests only: each integration test (`crates/*/tests`) links Bevy and OpenCASCADE into
       # its own large binary, too much for a hosted runner's disk. Run them locally with
       # `cargo test --workspace`.
@@ -145,12 +149,14 @@ jobs:
         with:
           key: web
 
-      # With tools/web/build.sh's features.
+      # With tools/web/build.sh's features: the WebGPU build, then the WebGL2 one.
       - name: Check
-        run: cargo check --locked --target wasm32-unknown-unknown -p cadrs --no-default-features -F gpu
+        run: |
+          cargo check --locked --target wasm32-unknown-unknown -p cadrs --no-default-features -F gpu,webgpu
+          cargo check --locked --target wasm32-unknown-unknown -p cadrs --no-default-features
 
   macos:
-    name: Build and test (macOS)
+    name: Build (macOS)
     runs-on: macos-26
     timeout-minutes: 120
     steps:
@@ -164,8 +170,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Build only: the tests run on Linux, and building them again here took the job past its
+      # two hours on a cold cache.
       - name: Build
         run: cargo build --workspace
-
-      - name: Test
-        run: cargo test --workspace --exclude cadrs --lib

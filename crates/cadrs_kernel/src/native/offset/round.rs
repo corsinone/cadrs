@@ -8,7 +8,7 @@
 //! less each kept face swept in, a tube round each concave edge and a ball at each concave
 //! vertex. Outward, the grown body less the body, cut back to the removed faces' planes.
 
-use crate::native::blend::{Tracked, ball_body};
+use crate::native::blend::{Tracked, ball_body, ball_frame};
 use crate::native::boolean::boolean_bodies;
 use crate::native::curve::Curve;
 use crate::native::kernel::NativeKernel;
@@ -432,7 +432,278 @@ pub fn offset_rounded(b: &Body, dist: &[f64]) -> Result<Body> {
             "rounded offsets with different distances per face",
         ));
     }
+    // A solid of revolution: its section grown, revolved.
+    if let Some(g) = crate::native::sweep_solid::grown_revolved(b, d) {
+        return Ok(g);
+    }
     grown_except(&merged(b), d, &[], &[])
+}
+
+/// A convex polyhedron grown by a ball of radius `d`, built face by face: each face moved out
+/// by `d`, a cylinder of radius `d` along each edge between its faces' moved copies, and a ball
+/// patch at each corner bounded by its edges' end arcs. The same solid the slabs', tubes' and
+/// balls' union makes, without the dozens of booleans. None unless every face is a plane with
+/// one loop and every edge a straight convex edge between two faces (then the result is checked).
+fn grown_convex(b: &Body, d: f64) -> Option<Body> {
+    use crate::native::pcurve::pcurve;
+    use crate::native::topo::{BodyBuilder, Coedge};
+    use std::collections::HashMap;
+    if b.solids.len() != 1 || b.shells.len() != 1 || !b.shells[0].closed {
+        return None;
+    }
+    let ef = b.edge_faces();
+    // Each face's outward normal; every face a plane with one loop.
+    let mut normal = Vec::with_capacity(b.faces.len());
+    for f in &b.faces {
+        let Surface::Plane { f: fr } = &f.surf else {
+            return None;
+        };
+        if f.loops.len() != 1 {
+            return None;
+        }
+        normal.push(fr.x.cross(&fr.y).normalize() * if f.sense { 1.0 } else { -1.0 });
+    }
+    // Each edge straight, convex, and run forward by exactly one of its two faces: (f1, f2).
+    let mut sides = vec![(usize::MAX, usize::MAX); b.edges.len()];
+    for (fi, f) in b.faces.iter().enumerate() {
+        for co in &f.loops[0] {
+            let s = &mut sides[co.edge];
+            let slot = if co.fwd { &mut s.0 } else { &mut s.1 };
+            if *slot != usize::MAX {
+                return None;
+            }
+            *slot = fi;
+        }
+    }
+    for (e, ed) in b.edges.iter().enumerate() {
+        if ed.degenerate
+            || !matches!(ed.curve, Curve::Line { .. })
+            || ef[e].len() != 2
+            || sides[e].0 == usize::MAX
+            || sides[e].1 == usize::MAX
+            || convex(b, e) != Some(true)
+        {
+            return None;
+        }
+    }
+    let mut out = BodyBuilder::new();
+    let mut vert: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut at = |out: &mut BodyBuilder, f: usize, v: usize| -> usize {
+        *vert
+            .entry((f, v))
+            .or_insert_with(|| out.vertex(b.verts[v].p + normal[f] * d))
+    };
+    // The moved faces' edges: (face, edge) -> new edge, in the old edge's direction.
+    let mut line: HashMap<(usize, usize), usize> = HashMap::new();
+    for e in 0..b.edges.len() {
+        let [v0, v1] = b.edges[e].v;
+        for f in [sides[e].0, sides[e].1] {
+            let (a, z) = (at(&mut out, f, v0), at(&mut out, f, v1));
+            let (pa, pz) = (b.verts[v0].p + normal[f] * d, b.verts[v1].p + normal[f] * d);
+            let c = Curve::Line { o: pa, d: pz - pa };
+            line.insert((f, e), out.edge(c, 0.0, 1.0, a, z));
+        }
+    }
+    // Each edge's end arcs, about its vertices from f1's side to f2's: (edge, vertex) -> new edge.
+    let mut arc: HashMap<(usize, usize), (usize, Curve, f64)> = HashMap::new();
+    for e in 0..b.edges.len() {
+        let (f1, f2) = sides[e];
+        let (n1, n2) = (normal[f1], normal[f2]);
+        let y = (n2 - n1 * n1.dot(&n2)).try_normalize(tol::ANGULAR)?;
+        let th = n1.dot(&n2).clamp(-1.0, 1.0).acos();
+        for w in b.edges[e].v {
+            let c = Curve::Circle {
+                c: b.verts[w].p,
+                x: n1,
+                y,
+                r: d,
+            };
+            let (a, z) = (at(&mut out, f1, w), at(&mut out, f2, w));
+            let id = out.edge(c.clone(), 0.0, th, a, z);
+            arc.insert((e, w), (id, c, th));
+        }
+    }
+    let co = |surf: &Surface, near: P2, id: usize, c: &Curve, t0: f64, t1: f64, fwd: bool| Coedge {
+        edge: id,
+        fwd,
+        pc: pcurve(surf, c, t0, t1, Some(near)),
+    };
+    let line_curve = |f: usize, e: usize| {
+        let [v0, v1] = b.edges[e].v;
+        let pa = b.verts[v0].p + normal[f] * d;
+        let pz = b.verts[v1].p + normal[f] * d;
+        Curve::Line { o: pa, d: pz - pa }
+    };
+    let sensed = |surf: &Surface, p: P3, out_dir: V3| {
+        let (u, v) = surf.project(&p, None);
+        (P2::new(u, v), surf.normal(u, v).dot(&out_dir) > 0.0)
+    };
+    let mut faces = Vec::new();
+    // The moved faces.
+    for (fi, f) in b.faces.iter().enumerate() {
+        let Surface::Plane { f: fr } = &f.surf else {
+            return None;
+        };
+        let surf = Surface::Plane {
+            f: Frame {
+                o: fr.o + normal[fi] * d,
+                ..*fr
+            },
+        };
+        let p = b.verts[b.edges[f.loops[0][0].edge].v[0]].p + normal[fi] * d;
+        let (near, _) = sensed(&surf, p, normal[fi]);
+        let lp = f.loops[0]
+            .iter()
+            .map(|c| {
+                co(
+                    &surf,
+                    near,
+                    line[&(fi, c.edge)],
+                    &line_curve(fi, c.edge),
+                    0.0,
+                    1.0,
+                    c.fwd,
+                )
+            })
+            .collect();
+        faces.push(out.face(surf, f.sense, vec![lp]));
+    }
+    // The edges' cylinders.
+    for e in 0..b.edges.len() {
+        let (f1, f2) = sides[e];
+        let [v0, v1] = b.edges[e].v;
+        let (p0, p1) = (b.verts[v0].p, b.verts[v1].p);
+        let mid_dir = (normal[f1] + normal[f2]).normalize();
+        let surf = Surface::Cylinder {
+            f: Frame::from_xz(p0, -mid_dir, p1 - p0),
+            r: d,
+        };
+        let (near, sense) = sensed(&surf, nalgebra::center(&p0, &p1) + mid_dir * d, mid_dir);
+        let (a1, c1, t1) = &arc[&(e, v1)];
+        let (a0, c0, t0) = &arc[&(e, v0)];
+        let lp = vec![
+            co(
+                &surf,
+                near,
+                line[&(f2, e)],
+                &line_curve(f2, e),
+                0.0,
+                1.0,
+                true,
+            ),
+            co(&surf, near, *a1, c1, 0.0, *t1, false),
+            co(
+                &surf,
+                near,
+                line[&(f1, e)],
+                &line_curve(f1, e),
+                0.0,
+                1.0,
+                false,
+            ),
+            co(&surf, near, *a0, c0, 0.0, *t0, true),
+        ];
+        faces.push(out.face(surf, sense, vec![lp]));
+    }
+    // The corners' balls: each bounded by its edges' arcs, each run the other way from its
+    // cylinder (which runs an edge's end arc from f2's side to f1's, its start arc from f1's to
+    // f2's).
+    let mut around: Vec<Vec<(usize, bool)>> = vec![Vec::new(); b.verts.len()];
+    for (e, ed) in b.edges.iter().enumerate() {
+        let [v0, v1] = ed.v;
+        around[v0].push((e, false));
+        around[v1].push((e, true));
+    }
+    for (w, arcs) in around.iter().enumerate() {
+        if arcs.is_empty() {
+            continue;
+        }
+        let m = arcs
+            .iter()
+            .flat_map(|&(e, _)| [normal[sides[e].0], normal[sides[e].1]])
+            .fold(V3::zeros(), |a, n| a + n)
+            .try_normalize(tol::ANGULAR)?;
+        let pw = b.verts[w].p;
+        // Chain the arcs: each from its start vertex to its end vertex in the loop's direction.
+        let ends = |&(e, fwd): &(usize, bool)| {
+            let (f1, f2) = sides[e];
+            if fwd {
+                ((f1, w), (f2, w))
+            } else {
+                ((f2, w), (f1, w))
+            }
+        };
+        let mut order = vec![arcs[0]];
+        while order.len() < arcs.len() {
+            let (_, end) = ends(order.last()?);
+            let next = arcs
+                .iter()
+                .find(|a| ends(a).0 == end && !order.contains(a))?;
+            order.push(*next);
+        }
+        if ends(order.last()?).1 != ends(&order[0]).0 {
+            return None;
+        }
+        // The ball's pole at the corner's point on one of its faces: the arcs through it are
+        // meridians, and those square to it the equator, both with exact p-curves (any other
+        // arc's is fitted, which costs more than the rest of the body): the face that makes
+        // the most of them.
+        let starts: Vec<usize> = order.iter().map(|a| ends(a).0.0).collect();
+        let k = starts.len();
+        let exact = |p: usize| {
+            let np = normal[p];
+            (0..k)
+                .filter(|&i| {
+                    let (fa, fb) = (starts[i], starts[(i + 1) % k]);
+                    fa == p
+                        || fb == p
+                        || (normal[fa].dot(&np).abs() < tol::ANGULAR_FINE
+                            && normal[fb].dot(&np).abs() < tol::ANGULAR_FINE)
+                })
+                .count()
+        };
+        let pole = *starts.iter().max_by_key(|&&p| exact(p))?;
+        let surf = Surface::Sphere {
+            f: Frame::from_xz(pw, m, normal[pole]),
+            r: d,
+        };
+        let (near, sense) = sensed(&surf, pw + m * d, m);
+        let mut lp: Vec<Coedge> = order
+            .iter()
+            .map(|&(e, fwd)| {
+                let (id, c, th) = &arc[&(e, w)];
+                co(&surf, near, *id, c, 0.0, *th, fwd)
+            })
+            .collect();
+        // At the pole, the loop runs along it in u from the arc coming in to the arc going out.
+        let i = (0..k).find(|&i| starts[(i + 1) % k] == pole)?;
+        // (Each arc's edge runs over 0..θ.)
+        let end_uv = |j: usize, at_end: bool| {
+            let (e, fwd) = order[j];
+            lp[j]
+                .pc
+                .point(if fwd == at_end { arc[&(e, w)].2 } else { 0.0 })
+        };
+        let (a, z) = (end_uv(i, true), end_uv((i + 1) % k, false));
+        let pole_v = at(&mut out, pole, w);
+        let de = out.degenerate_edge(pw + normal[pole] * d, 0.0, 1.0, pole_v);
+        lp.insert(
+            i + 1,
+            Coedge {
+                edge: de,
+                fwd: true,
+                pc: Curve::Line {
+                    o: P3::new(a.x, a.y, 0.0),
+                    d: V3::new(z.x - a.x, z.y - a.y, 0.0),
+                },
+            },
+        );
+        faces.push(out.face(surf, sense, vec![lp]));
+    }
+    let shell = out.shell(faces, true);
+    out.solid(vec![shell]);
+    let body = out.build().ok()?;
+    body.check().is_empty().then_some(body)
 }
 
 /// A face's outward normal at a point on it.
@@ -452,6 +723,13 @@ fn outward_normal(b: &Body, fi: usize, p: &P3) -> V3 {
 /// `skip` (an outward shell's curved removed faces, whose slabs the caller cuts away). `b` is
 /// [`merged`] already.
 fn grown_except(b: &Body, d: f64, cut: &[(P3, V3)], skip: &[usize]) -> Result<Body> {
+    // A convex polyhedron: grown whole, directly (what lies beyond a cut plane, which the pieces
+    // here leave out, the callers cut away after).
+    if skip.is_empty()
+        && let Some(g) = grown_convex(b, d)
+    {
+        return Ok(g);
+    }
     let size = 1.0 + b.bbox().diagonal();
     let ef = b.edge_faces();
     // The cut plane each face lies on.
@@ -673,7 +951,12 @@ pub fn shell(k: &mut NativeKernel, body: BodyId, spec: &ShellSpec) -> Result<OpR
         };
         let regions = || cavity_by_regions(&b, &remove, t);
         let ways: Vec<Box<dyn Fn() -> Result<Body>>> = if (concave || crossing) && !spec.sharp {
-            vec![Box::new(regions)]
+            // A prism opened at a cap, or hollowed: its outline's inset, rounded about the
+            // reflex corners, extruded from the kept caps' insets to past the removed ones.
+            match super::prism::curved_prism_inset(&b, &dist, true, false) {
+                Some(Ok(c)) => vec![Box::new(move || Ok(c.clone())), Box::new(regions)],
+                _ => vec![Box::new(regions)],
+            }
         } else {
             vec![
                 Box::new(|| sharp(&dist)),
@@ -681,9 +964,40 @@ pub fn shell(k: &mut NativeKernel, body: BodyId, spec: &ShellSpec) -> Result<OpR
                 Box::new(regions),
             ]
         };
+        // The cavity with the removed faces moved out past the body reaches past them by the
+        // walls' insets: where a kept face rises from the opening beyond its plane (an L opened
+        // at its low step, issue #237), the corner of the moved face and that face's inset lies
+        // inside its wall, and the cavity eats it. The cavity flush with the openings doesn't,
+        // and lies wholly in the body: the moved one may take out no more than it does.
+        let moved = !((concave || crossing) && !spec.sharp);
+        // (Only where some face reaches past a removed face's plane, by its box: else no wall
+        // rises beyond an opening for the cavity past it to cut into.)
+        let size_tol = tol::POINT.max(tol::REL * size);
+        let past_openings = remove.iter().any(|&f| {
+            let Surface::Plane { f: fr } = &b.faces[f].surf else {
+                return true;
+            };
+            let n = fr.x.cross(&fr.y).normalize() * if b.faces[f].sense { 1.0 } else { -1.0 };
+            (0..b.faces.len()).any(|g| {
+                let bb = b.face_bbox(g);
+                let far = P3::new(
+                    if n.x > 0.0 { bb.max.x } else { bb.min.x },
+                    if n.y > 0.0 { bb.max.y } else { bb.min.y },
+                    if n.z > 0.0 { bb.max.z } else { bb.min.z },
+                );
+                (far - fr.o).dot(&n) > size_tol
+            })
+        });
+        let flush_volume = if moved && past_openings {
+            sharp(&flush)
+                .ok()
+                .map(|c| crate::native::mass::body_volume(&c))
+        } else {
+            None
+        };
         let mut first: Option<KernelError> = None;
         let mut done = None;
-        for way in &ways {
+        for (i, way) in ways.iter().enumerate() {
             let out = way().and_then(|cavity| {
                 let mut out = cur.apply(
                     &cavity,
@@ -705,6 +1019,16 @@ pub fn shell(k: &mut NativeKernel, body: BodyId, spec: &ShellSpec) -> Result<OpR
                     return Err(KernelError::InvalidResult {
                         op: "shell",
                         why: "the shell came out wrong".into(),
+                    });
+                }
+                if moved
+                    && i == 0
+                    && let Some(fv) = flush_volume
+                    && v0 - v1 > fv + 1e-7 * v0.max(1.0)
+                {
+                    return Err(KernelError::InvalidResult {
+                        op: "shell",
+                        why: "the cavity past the opening cut into a wall".into(),
                     });
                 }
                 // Walls that meet everywhere leave no cavity.
@@ -797,6 +1121,38 @@ pub fn shell(k: &mut NativeKernel, body: BodyId, spec: &ShellSpec) -> Result<OpR
                 let keep = tangent_slabs_beyond(&mb, t, fr.o, n.normalize(), &remove)?;
                 if !keep.is_empty() {
                     hs = combine_all(hs, keep, BoolOp::Subtract)?;
+                }
+                // Nor the walls of the body's part beyond the plane (a leg of an L rising past
+                // its opened step, issue #237): they are that part grown by t.
+                // (None when the body's faces are flat and its corners all lie on or behind the
+                // plane: it lies within their hull, a convex block opened at a face.)
+                let m = n.normalize();
+                let behind = mb
+                    .faces
+                    .iter()
+                    .all(|g| matches!(g.surf, Surface::Plane { .. }))
+                    && mb
+                        .verts
+                        .iter()
+                        .all(|v| (v.p - fr.o).dot(&m) <= tol::POINT.max(tol::REL * size));
+                let beyond = if behind {
+                    None
+                } else {
+                    match combine(&mb, &hs, BoolOp::Intersect, &|| {
+                        format!("the body beyond removed face {f}")
+                    }) {
+                        Ok(x) => Some(x),
+                        Err(KernelError::EmptyResult(_)) => None,
+                        Err(e) => return Err(e),
+                    }
+                };
+                if let Some(beyond) = beyond
+                    && crate::native::mass::body_volume(&beyond) > tol::ROUNDOFF
+                {
+                    let walls_beyond = offset_rounded(&beyond, &vec![t; beyond.faces.len()])?;
+                    hs = combine(&hs, &walls_beyond, BoolOp::Subtract, &|| {
+                        format!("the walls beyond removed face {f}")
+                    })?;
                 }
                 walls = walls.apply(&hs, &vec![Vec::new(); hs.faces.len()], BoolOp::Subtract)?;
             }
@@ -1189,8 +1545,9 @@ enum Support {
     Plane(P3, V3),
     /// Inside (true) or outside the cylinder about the axis (o, z) of radius r.
     Cylinder(P3, V3, f64, bool),
-    /// Inside (true) or outside the sphere about c of radius r.
-    Sphere(P3, f64, bool),
+    /// Inside (true) or outside the sphere of radius r about the frame's origin (the frame the
+    /// face's own: a ball made for it keeps its poles and seam).
+    Sphere(Frame, f64, bool),
     /// Inside (true) or outside the cone about the axis (o, z): of radius `r` at o, its radius
     /// growing by `tan` a unit of height along z, `cos` the cosine of its half-angle (a moved
     /// cone's radius at a height differs by the distance over that).
@@ -1214,8 +1571,8 @@ impl Support {
                 let rho = (w - z * w.dot(z)).norm();
                 if *inside { rho - r } else { r - rho }
             }
-            Support::Sphere(c, r, inside) => {
-                let rho = (p - c).norm();
+            Support::Sphere(f, r, inside) => {
+                let rho = (p - f.o).norm();
                 if *inside { rho - r } else { r - rho }
             }
             // (Past the apex the cone's radius is less than nothing: no point there is inside
@@ -1283,7 +1640,7 @@ fn cavity_of_supports(b: &Body, remove: &[usize], t: f64) -> Option<Result<Optio
                 let radial = (q - fr.o) - z * (q - fr.o).dot(&z);
                 Support::Cylinder(fr.o, z, *r, radial.dot(&n) > 0.0)
             }
-            Surface::Sphere { f: fr, r } => Support::Sphere(fr.o, *r, (q - fr.o).dot(&n) > 0.0),
+            Surface::Sphere { f: fr, r } => Support::Sphere(*fr, *r, (q - fr.o).dot(&n) > 0.0),
             Surface::Cone { f: fr, r, a } if a.tan().abs() > tol::ANGULAR && a.cos() > 0.0 => {
                 let z = fr.z.normalize();
                 let radial = (q - fr.o) - z * (q - fr.o).dot(&z);
@@ -1404,13 +1761,17 @@ fn cavity_of_supports(b: &Body, remove: &[usize], t: f64) -> Option<Result<Optio
                     (big(o, z, r - t)?, BoolOp::Intersect)
                 }
                 Support::Cylinder(o, z, r, false) => (big(o, z, r + t)?, BoolOp::Subtract),
-                Support::Sphere(c, r, true) => {
+                // (About the face's own axis: a circle square to it, where an opening's plane
+                // meets the ball, is then one of its parallels, with an exact p-curve.)
+                Support::Sphere(f, r, true) => {
                     if r - t <= close {
                         return Ok(None);
                     }
-                    (ball_body(c, r - t)?, BoolOp::Intersect)
+                    (ball_frame(f.o, r - t, f.z, f.x)?, BoolOp::Intersect)
                 }
-                Support::Sphere(c, r, false) => (ball_body(c, r + t)?, BoolOp::Subtract),
+                Support::Sphere(f, r, false) => {
+                    (ball_frame(f.o, r + t, f.z, f.x)?, BoolOp::Subtract)
+                }
             });
         }
         keep.sort_by_key(|(_, op)| *op == BoolOp::Subtract);
@@ -1815,4 +2176,134 @@ fn cylinder_domain(b: &Body, fi: usize) -> Option<(f64, f64, f64, f64)> {
         }
     }
     Some((lo, hi, u0, u1))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::native::kernel::NativeKernel;
+    use crate::*;
+    use nalgebra::Point3;
+    use std::f64::consts::PI;
+
+    /// A cube of side a grown by r, built directly (a convex polyhedron): its volume
+    /// a³ + 6a²r + 3πar² + 4πr³/3 and area 6a² + 6πar + 4πr², and its 26 faces (6 moved, 12
+    /// cylinder strips, 8 ball corners).
+    #[test]
+    fn a_cube_grown_is_built_directly_and_measures_right() {
+        let (a, r) = (10.0, 1.0);
+        let mut k = NativeKernel::new();
+        let id = k
+            .primitive(&Primitive::Box {
+                min: Point3::new(0.0, 0.0, 0.0),
+                max: Point3::new(a, a, a),
+            })
+            .unwrap()
+            .bodies[0];
+        let b = (**k.get(id).unwrap()).clone();
+        let g = super::grown_convex(&b, r).expect("a cube is a convex polyhedron");
+        assert_eq!(g.faces.len(), 26);
+        let gid = k.insert(g);
+        let m = k.mass_properties(gid).unwrap();
+        let volume =
+            a * a * a + 6.0 * a * a * r + 3.0 * PI * a * r * r + 4.0 * PI * r * r * r / 3.0;
+        let area = 6.0 * a * a + 6.0 * PI * a * r + 4.0 * PI * r * r;
+        assert!(
+            (m.volume - volume).abs() < 1e-9 * volume,
+            "{} {volume}",
+            m.volume
+        );
+        assert!(
+            (m.surface_area - area).abs() < 1e-9 * area,
+            "{} {area}",
+            m.surface_area
+        );
+    }
+
+    /// A cylinder and a cone grown by revolving their grown sections agree with the general
+    /// route (the slabs', tubes' and balls' union): volume and area to 1e-9, the same faces.
+    #[test]
+    fn solids_of_revolution_grown_agree_with_the_general_route() {
+        let z = nalgebra::Unit::new_normalize(nalgebra::Vector3::z());
+        let shapes = [
+            Primitive::Cylinder {
+                base: Point3::new(1.0, 2.0, 0.0),
+                axis: z,
+                radius: 5.0,
+                height: 10.0,
+            },
+            Primitive::Cone {
+                base: Point3::new(0.0, 0.0, -3.0),
+                axis: z,
+                base_radius: 6.0,
+                top_radius: 0.0,
+                height: 9.0,
+            },
+            Primitive::Cone {
+                base: Point3::new(0.0, 0.0, 0.0),
+                axis: z,
+                base_radius: 6.0,
+                top_radius: 2.0,
+                height: 5.0,
+            },
+        ];
+        for shape in shapes {
+            let mut k = NativeKernel::new();
+            let id = k.primitive(&shape).unwrap().bodies[0];
+            let b = (**k.get(id).unwrap()).clone();
+            let fast = crate::native::sweep_solid::grown_revolved(&b, 1.5).expect("revolved");
+            let general = super::grown_except(&super::merged(&b), 1.5, &[], &[]).unwrap();
+            let (f, g) = (k.insert(fast), k.insert(general));
+            let (mf, mg) = (k.mass_properties(f).unwrap(), k.mass_properties(g).unwrap());
+            assert!(
+                (mf.volume - mg.volume).abs() < 1e-9 * mg.volume,
+                "{shape:?}: {} {}",
+                mf.volume,
+                mg.volume
+            );
+            assert!((mf.surface_area - mg.surface_area).abs() < 1e-9 * mg.surface_area);
+            assert_eq!(k.faces(f).unwrap().len(), k.faces(g).unwrap().len());
+        }
+    }
+
+    /// An L-shaped prism (arms 20 × 5 and 5 × 15, 8 tall) shrunk by 1 and shelled 1 thick open
+    /// at its top, by its outline's inset: the inset outline is the arms' 18 × 3 and 3 × 10
+    /// rectangles, joined past their corner by the square of side 1 less the quarter disc about
+    /// the reflex corner, area 85 − π/4; the inset 6 tall, the cavity 7.
+    #[test]
+    fn an_l_prism_shrunk_and_shelled_measures_right() {
+        use crate::native::surface::Surface;
+        let outline = Loop::polygon(&[
+            [0.0, 0.0],
+            [20.0, 0.0],
+            [20.0, 5.0],
+            [5.0, 5.0],
+            [5.0, 15.0],
+            [0.0, 15.0],
+        ]);
+        let inset_area = 85.0 - PI / 4.0;
+        let mut k = NativeKernel::new();
+        let id = k
+            .extrude(
+                &Profile::of(Plane::xy(0.0), vec![outline]),
+                Extent::Blind(8.0),
+            )
+            .unwrap()
+            .bodies[0];
+        let b = (**k.get(id).unwrap()).clone();
+        let shrunk = super::inset_rounded(&b, &vec![-1.0; b.faces.len()]).unwrap();
+        let s = k.insert(shrunk);
+        let v = k.mass_properties(s).unwrap().volume;
+        assert!((v - 6.0 * inset_area).abs() < 1e-9 * v, "{v}");
+        let top = (0..b.faces.len())
+            .find(|&f| match &b.faces[f].surf {
+                Surface::Plane { f: fr } => (fr.o.z - 8.0).abs() < 1e-9,
+                _ => false,
+            })
+            .unwrap();
+        let spec = ShellSpec::inward(vec![FaceId(top as u64)], 1.0);
+        let shelled = k.shell_with(id, &spec).unwrap().bodies[0];
+        let v = k.mass_properties(shelled).unwrap().volume;
+        let want = 150.0 * 8.0 - 7.0 * inset_area;
+        assert!((v - want).abs() < 1e-9 * want, "{v} {want}");
+    }
 }

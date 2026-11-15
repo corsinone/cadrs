@@ -9,13 +9,26 @@ pub trait Pick: Kernel {
     /// The face of `body` nearest `point` (a point on it, away from its edges).
     fn face_at(&self, body: BodyId, point: Point3<f64>) -> Result<FaceId> {
         let mut best: Option<(f64, FaceId)> = None;
-        for f in self.faces(body)? {
+        // The faces whose middles are nearest first: the face through the point is most often
+        // among them, and the search stops on it.
+        let mut faces = self.faces(body)?;
+        faces.sort_by(|a, b| {
+            (a.center - point)
+                .norm_squared()
+                .total_cmp(&(b.center - point).norm_squared())
+        });
+        for f in faces {
             let d = self.min_distance(
                 &DistanceTarget::Point(point),
                 &DistanceTarget::Face(body, f.id),
             )?;
             if best.is_none_or(|(b, _)| d.distance < b) {
                 best = Some((d.distance, f.id));
+            }
+            // On the face (to a nanometre): no other face is nearer, so none need be measured
+            // (on an edge, where two faces tie, either was the pick).
+            if d.distance <= 1e-9 {
+                break;
             }
         }
         best.map(|(_, f)| f)

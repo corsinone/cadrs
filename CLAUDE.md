@@ -23,8 +23,9 @@ Onshape-style CAD in Rust + Bevy 0.20.1. Local notes in `docs/` (git-ignored: `P
   debugging. Kernel work besides rebuilds is a named `rebuild::task::Task`, not a closure.
 - Windowed run from a shell with no display: prefix `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000`.
 - Windows exe: `cargo build -r --target x86_64-pc-windows-gnu` (MinGW is installed).
-- Browser build: `tools/web/build.sh` → `target/web/` (WebAssembly, drawn with WebGPU; serve the
-  folder over HTTP). Needs wasm-bindgen-cli at Cargo.lock's version. Releases attach it as
+- Browser build: `tools/web/build.sh` → `target/web/` (WebAssembly, built twice: drawn with
+  WebGPU, and with WebGL2 for browsers without it, `CADRS_WEB_ONLY=webgpu|webgl2` for one; serve
+  the folder over HTTP). Needs wasm-bindgen-cli at Cargo.lock's version. Releases attach it as
   `cadrs-v<version>-web.tar.gz`; main's is the whole site, https://cadrs.net (see "Project
   site" below). A page has one
   thread and no `std::fs` or `std` clock, so code it runs (everything but `cadrs_mcp`, the
@@ -46,6 +47,9 @@ Onshape-style CAD in Rust + Bevy 0.20.1. Local notes in `docs/` (git-ignored: `P
 - Kernel debugging: `CADRS_PROFILE=1`, `CADRS_BOOL_DEBUG=1` and `CADRS_DUMP_DIR=<dir>` (inputs of
   failing shells/fillets, replayed by `crates/cadrs_kernel/tests/native_debug.rs`); see the
   kernel README. The kernel is pure Rust (`cadrs_kernel::native`); there is no OCCT any more.
+- Input latency: windowed runs drop Bevy's pipelined rendering and queue one frame (so a
+  sketch drag keeps up with the cursor); `CADRS_PIPELINED=1`, `CADRS_FRAME_LATENCY=2` restore
+  Bevy's defaults to compare (`cadrs_harness::default_plugins`).
 - App debugging: `CADRS_SLOW_FRAMES=<ms>` logs every frame slower than that with its slowest
   systems (`cadrs_app::debug_tools`; add further env-switched aids there). `CADRS_NO_VSYNC=1`
   shows a frame's real cost; `CADRS_UI_CHANGES=1` names the UI nodes that change every frame
@@ -58,13 +62,18 @@ Onshape-style CAD in Rust + Bevy 0.20.1. Local notes in `docs/` (git-ignored: `P
 - Cold builds take 4+ minutes. Never run two cargo builds at once.
 - Project site: https://cadrs.net is the app itself, full screen: `.github/workflows/pages.yml`
   builds the browser build of every push to main and deploys it to GitHub Pages (also by hand),
-  so the site is always main's head, about 20 minutes after the push. In a browser without
-  WebGPU the page offers the downloads instead; the app menu links to GitHub.
+  so the site is always main's head, about 20 minutes after the push. In a browser with
+  neither WebGPU nor WebGL2 the page offers the downloads instead; the app menu links to GitHub.
 
 ## Layout
 - Crates in `crates/*`; shared versions in root `[workspace.dependencies]`.
 - `vendor/`: patched copies of dependencies (`[patch.crates-io]`), each with a `CADRS.md` saying
   what changed and why: gpu-allocator stages wgpu's uploads in system memory.
+- Bevy comes from our fork, https://github.com/rvdende/bevy, branch `cadrs-0.20.1` (the release
+  plus the fixes we need before Bevy ships them; the root `Cargo.toml`'s `[patch.crates-io]`
+  names every Bevy crate, so one copy of each is built). A fix goes on that branch and, off
+  Bevy's main, on a branch of its own for a pull request upstream; `cargo update -w` then moves
+  `Cargo.lock` to the branch's head.
 - `cadrs_core` and `cadrs_sketch` don't depend on bevy.
 - Library parts are data, never code: `libraries/<Library>/<name>.symbol.ron|.footprint.ron`,
   read at runtime. `cargo run -r -p cadrs_libgen -- libraries` rewrites the built-in ones from
@@ -76,7 +85,10 @@ Onshape-style CAD in Rust + Bevy 0.20.1. Local notes in `docs/` (git-ignored: `P
 
 ## Conventions
 - Every document or sketch change goes through the command/undo layer. Give UI elements a `Name`.
-- Icons: add missing ones to our icon-rs repo (`~/work/icon-rs`), then use them from there. Inter font.
+- Icons: `cadrs_icons` (vendored from icon-rs, which cadrs no longer uses). Add missing ones as
+  drawing functions in `crates/cadrs_icons_gen` and run `cargo run -r -p cadrs_icons_gen`
+  (`crates/cadrs_icons/HOWTO.md`); commit the generated SVGs and `src/generated.rs`. Every new
+  tool or feature gets its own icon: don't reuse another tool's. Inter font.
   Never copy Onshape's logo, name or icons.
 - Units are mm.
 - End commit messages with `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
