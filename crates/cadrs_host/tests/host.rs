@@ -773,6 +773,22 @@ fn command(dir: &Path, args: &[&str]) -> u8 {
 }
 
 #[test]
+fn the_first_commands_make_the_hosts_folder() {
+    // Users and settings come before the host first runs, into a folder not made yet.
+    let dir = temp_dir().join("host");
+    let id = cadrs_net::bevy_iroh::iroh::SecretKey::from_bytes(&[1; 32])
+        .public()
+        .to_string();
+    let args = ["--host-user", "Ada", "--role", "admin", "--id", &id];
+    assert_eq!(command(&dir, &args), 0);
+    assert_eq!(Users::read(&dir).unwrap().role(&id), Some(Role::Admin));
+    let dir = temp_dir().join("other");
+    assert_eq!(command(&dir, &["--host-settings", "--public", "on"]), 0);
+    let text = std::fs::read_to_string(dir.join(cadrs_host::SETTINGS_FILE)).unwrap();
+    assert!(text.contains("public: true"), "{text}");
+}
+
+#[test]
 fn the_commands_look_after_users_and_maintainers() {
     let dir = temp_dir();
     let doc = Document::new("Bracket");

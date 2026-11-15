@@ -183,7 +183,8 @@ fn edit_settings(dir: &Path, f: impl FnOnce(&mut Settings)) -> Result<(), String
         .map_err(|e| e.to_string())?;
     let path = dir.join(SETTINGS_FILE);
     let tmp = path.with_extension("ron.tmp");
-    cadrs_fs::write(&tmp, text)
+    cadrs_fs::create_dir_all(dir)
+        .and_then(|_| cadrs_fs::write(&tmp, text))
         .and_then(|_| cadrs_fs::rename(&tmp, &path))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -418,12 +419,16 @@ pub fn run(host: Host) -> AppExit {
                     host.dir.display()
                 );
             }
+            let some = |n: usize, one: &str| match n {
+                1 => format!("1 {one}"),
+                n => format!("{n} {one}s"),
+            };
             println!(
-                "{} users: {} admins, {} maintainers, {} collaborators",
-                users.users.len(),
-                count(Role::Admin),
-                count(Role::Maintainer),
-                count(Role::Collaborator)
+                "{}: {}, {}, {}",
+                some(users.users.len(), "user"),
+                some(count(Role::Admin), "admin"),
+                some(count(Role::Maintainer), "maintainer"),
+                some(count(Role::Collaborator), "collaborator")
             );
             if settings.public {
                 println!("In the public room (--public off to leave it).");

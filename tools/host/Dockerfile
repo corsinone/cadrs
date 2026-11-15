@@ -1,6 +1,7 @@
 # The cadrs team host (cadrs --host): the always-online owner of a team's shared documents. Its
-# identity (its cadrs ID), its settings (host.ron: admins, public room) and the documents it
-# owns are in /data. Admins are added by passing `--admin <cadrs ID>` to `docker run` once.
+# identity (its cadrs ID), its users (users.ron), its settings (host.ron) and the documents it
+# owns are in /data. Users are added with `docker exec cadrs-host cadrs --host-user …`
+# (tools/host/README.md).
 FROM ubuntu:26.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libudev1 libwayland-client0 libasound2t64 libffi8 ca-certificates \

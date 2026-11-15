@@ -96,7 +96,9 @@ impl Users {
             .map_err(|e| e.to_string())?;
         let path = dir.join(USERS_FILE);
         let tmp = path.with_extension("ron.tmp");
-        cadrs_fs::write(&tmp, text)
+        // The first user may come before the host ever ran, so before its folder exists.
+        cadrs_fs::create_dir_all(dir)
+            .and_then(|_| cadrs_fs::write(&tmp, text))
             .and_then(|_| cadrs_fs::rename(&tmp, &path))
             .map_err(|e| format!("{}: {e}", path.display()))
     }
