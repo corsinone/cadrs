@@ -369,6 +369,10 @@ fn render(page: &Page, users: &Users, me: &User, said: &str, error: &str) -> Str
     if !error.is_empty() {
         let _ = write!(h, "<div class=error>{}</div>", esc(error));
     }
+    if !said.is_empty() || !error.is_empty() {
+        // Said once: a reload, or someone else signing in on this browser, doesn't see it again.
+        h.push_str("<script>history.replaceState(null,'',location.pathname)</script>");
+    }
     let admin = me.role == Role::Admin;
     let documents: Vec<DocumentEntry> = admin::owned(&page.dir)
         .into_iter()
@@ -447,7 +451,7 @@ fn document_card(h: &mut String, users: &Users, admin: bool, e: &DocumentEntry) 
                 h,
                 " <form method=post action='{action}'><input type=hidden name=action \
                  value=not-maintainer><input type=hidden name=user value='{}'>\
-                 <button class=quiet title='No longer a maintainer'>×</button></form>",
+                 <button class=quiet title='No longer a maintainer'>Remove</button></form>",
                 esc(name)
             );
         }

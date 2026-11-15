@@ -463,6 +463,14 @@ pub fn run(admin: Admin) -> u8 {
                 }
             }
             print_document(&users, &e);
+            if e.meta.sharing.is_some() {
+                match link(dir, &e) {
+                    Some(link) => println!("    link: {link}"),
+                    None => {
+                        println!("    link: once the host has started (it has no cadrs ID yet)")
+                    }
+                }
+            }
             Ok(())
         }),
         Command::Settings {
@@ -573,7 +581,10 @@ pub(crate) fn find(dir: &Path, which: &str) -> Result<DocumentEntry, String> {
         .filter(|e| e.id.to_string() == which || e.name.eq_ignore_ascii_case(which))
         .collect();
     match found.len() {
-        0 => Err(format!("The host has no document {which}")),
+        0 => Err(format!(
+            "The host in {} has no document {which}",
+            dir.display()
+        )),
         1 => Ok(found.remove(0)),
         _ => Err(format!(
             "Several documents are called {which}: give one of their ids, {}",
@@ -612,6 +623,21 @@ fn print_user(users: &Users, u: &User, names: &[(DocumentId, String)]) {
     for id in &u.ids {
         println!("    {id}");
     }
+}
+
+/// The link to the host's document `e`, to pass on by hand: the host by its cadrs ID alone
+/// (peers find where it is), so it stays right when the host moves. `None` before the host
+/// first ran and made its key.
+fn link(dir: &Path, e: &DocumentEntry) -> Option<cadrs_net::ShareLink> {
+    let key = cadrs_fs::read(dir.join(cadrs_net::IDENTITY_FILE)).ok()?;
+    let key: [u8; 32] = key.as_slice().try_into().ok()?;
+    let id = cadrs_net::bevy_iroh::iroh::SecretKey::from_bytes(&key).public();
+    Some(cadrs_net::ShareLink {
+        document: e.id,
+        name: e.name.clone(),
+        topic: e.meta.sharing.as_ref()?.topic,
+        owner: cadrs_net::bevy_iroh::iroh::EndpointAddr::new(id),
+    })
 }
 
 fn print_document(users: &Users, e: &DocumentEntry) {
@@ -770,4 +796,35 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadrs_core::collab::Sharing;
+    use cadrs_core::library::DocumentMeta;
+    use cadrs_core::{Document, Store};
+
+    #[test]
+    fn a_shared_document_has_a_link_to_the_host_once_it_has_a_key() {
+        let dir = std::env::temp_dir().join(format!("cadrs-link-{}", uuid::Uuid::new_v4()));
+        let doc = Document::new("Frame");
+        let mut meta = DocumentMeta::new("host", 0);
+        meta.sharing = Some(Sharing::new([7; 32]));
+        Store::new(&dir).create(&doc, &meta).unwrap();
+        let entry = find(&dir, "frame").unwrap();
+        assert!(
+            link(&dir, &entry).is_none(),
+            "no key before the host first ran"
+        );
+        std::fs::write(dir.join(cadrs_net::IDENTITY_FILE), [3u8; 32]).unwrap();
+        let text = link(&dir, &entry).unwrap().to_string();
+        let back: cadrs_net::ShareLink = text.parse().unwrap();
+        let host = cadrs_net::bevy_iroh::iroh::SecretKey::from_bytes(&[3; 32]).public();
+        assert_eq!(back.owner.id, host);
+        assert_eq!((back.document, back.topic), (doc.id, [7; 32]));
+        let missing = find(&dir, "Bracket").unwrap_err();
+        assert!(missing.contains(&dir.display().to_string()), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
